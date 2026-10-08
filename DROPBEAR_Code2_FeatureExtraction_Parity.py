@@ -57,6 +57,15 @@ Features exported for every profile
         diagnostic determine whether the old DB6 'skip invalid window' behavior
         materially explains the mismatch.
 
+Fine-tuning
+-----------
+Window size and Takens delay are swept over the grids DB6_WINDOW_SIZES x
+DB6_DELAYS and DB8_WINDOW_SIZES x DB8_DELAYS. Every combination becomes one
+sheet named W<window>_T<delay>; the legacy profiles above are included in the
+default grids as baselines (marked Legacy=True in the Metadata sheet). The
+Metadata sheet also lists per-profile feature statistics and the correlation
+of each feature with the cart/pin location for quick comparison.
+
 IMPORTANT
 ---------
 This code only extracts features. It does not clip/normalize features for
@@ -104,10 +113,16 @@ DB6_CUTOFF = 100
 DB6_FILTER_ORDER = 5
 DB6_TIME_LIMIT = 6.0
 DB6_WINDOW_STEP = 25
-DB6_DELAY = 100
 DB6_DIM = 2
 DB6_EMBED_STRIDE = 25
-DB6_WINDOW_PROFILES = (1500, 1612)
+
+# --- DB6 fine-tuning grid (samples at 25000 Hz; 25 samples = 1 ms) ---
+# Every window size is run with every delay.
+# Legacy: windows 1500 (old VR) and 1612 (old FastTDA), delay 100.
+DB6_WINDOW_SIZES = [1250, 1500, 1612, 1750]
+DB6_DELAYS = [75, 100, 125]
+DB6_LEGACY_WINDOWS = (1500, 1612)
+DB6_LEGACY_DELAY = 100
 
 # Dataset 8 legacy/common settings
 DB8_FS = 5000
@@ -118,20 +133,14 @@ DB8_WINDOW_STEP = 5
 DB8_DIM = 2
 DB8_EMBED_STRIDE = 1
 
-# Two profiles are deliberate because the original VR/FastTDA scripts used
-# slightly different max_f constants (31.1 vs 31.0), changing int(window_size).
-DB8_PROFILES = [
-    {
-        "name": "W362_S1_M31p1",
-        "max_f": 31.1,
-        "legacy_role": "old VR profile",
-    },
-    {
-        "name": "W363_S1_M31p0",
-        "max_f": 31.0,
-        "legacy_role": "old FastTDA profile",
-    },
-]
+# --- DB8 fine-tuning grid (samples at 5000 Hz; 5 samples = 1 ms) ---
+# Every window size is run with every delay.
+# Legacy (from the formulas in db8_window_and_tau):
+#   max_f=31.1 -> window 362, delay 20 (old VR profile)
+#   max_f=31.0 -> window 363, delay 20 (old FastTDA profile)
+DB8_WINDOW_SIZES = [322, 362, 402]
+DB8_DELAYS = [15, 20, 25]
+DB8_LEGACY_MAX_F = (31.1, 31.0)
 
 # Alpha can be much slower than VR/FastTDA for thousands of windows.
 # Keep True for the requested 3-method parity extraction.
@@ -166,6 +175,21 @@ def minmax_to_50_200(x: np.ndarray) -> np.ndarray:
     if not np.isfinite(lo) or not np.isfinite(hi) or hi == lo:
         return np.full_like(x, 50.0, dtype=float)
     return 50.0 + (x - lo) * 150.0 / (hi - lo)
+
+
+def feature_summary(df: pd.DataFrame, label_col: str) -> dict:
+    """Per-profile statistics used to compare fine-tuning combinations."""
+    out = {}
+    for col in ("VR", "Alpha", "FastTDA"):
+        x = df[col].astype(float)
+        out[f"{col}_mean"] = float(np.nanmean(x)) if x.notna().any() else np.nan
+        out[f"{col}_std"] = float(np.nanstd(x)) if x.notna().any() else np.nan
+        ok = x.notna() & df[label_col].notna()
+        if ok.sum() > 2 and x[ok].std() > 0 and df.loc[ok, label_col].std() > 0:
+            out[f"Corr_{col}_{label_col}"] = float(np.corrcoef(x[ok], df.loc[ok, label_col])[0, 1])
+        else:
+            out[f"Corr_{col}_{label_col}"] = np.nan
+    return out
 
 
 # ============================================================
@@ -390,7 +414,7 @@ def load_dataset6(path: str):
     return t, acc_filt, cart_mm
 
 
-def extract_db6_profile(t, acc, cart_mm, window_size: int, progress_every=500):
+def extract_db6_profile(t, acc, cart_mm, window_size: int, delay: int, progress_every=500):
     """
     Exact diagnostic profile on one DB6 window size.
 
@@ -399,7 +423,7 @@ def extract_db6_profile(t, acc, cart_mm, window_size: int, progress_every=500):
     vr_model = VietorisRipsPersistence(homology_dimensions=[1])
     embedder = SingleTakensEmbedding(
         parameters_type="fixed",
-        time_delay=DB6_DELAY,
+        time_delay=delay,
         dimension=DB6_DIM,
         stride=DB6_EMBED_STRIDE,
         n_jobs=-1,
@@ -445,12 +469,13 @@ def extract_db6_profile(t, acc, cart_mm, window_size: int, progress_every=500):
             "FastTDA_FitOK": bool(fit_ok),
             "Window_Number": k,
             "Window_Size": int(window_size),
+            "Takens_Delay": int(delay),
         })
 
         k += 1
         if progress_every and k % progress_every == 0:
             print(
-                f"    DB6 W{window_size}: {k}/{n_windows} windows "
+                f"    DB6 W{window_size}_T{delay}: {k}/{n_windows} windows "
                 f"| elapsed {time.time()-t0:.1f} s"
             )
 
@@ -469,19 +494,26 @@ def run_dataset6(tag: str, filename: str):
 
     t, acc, cart_mm = load_dataset6(input_path)
 
-    out_path = os.path.join(WORK_DIR, f"Code2_{tag}_DB6_ParityProfiles.xlsx")
+    out_path = os.path.join(WORK_DIR, f"Code2_{tag}_DB6_FineTune.xlsx")
 
     metadata_rows = []
     profile_frames = {}
 
-    for window_size in DB6_WINDOW_PROFILES:
-        profile_name = f"W{window_size}"
-        print(f"  Running profile {profile_name}")
+    combos = [(w, d) for w in DB6_WINDOW_SIZES for d in DB6_DELAYS]
+    for i, (window_size, delay) in enumerate(combos, 1):
+        profile_name = f"W{window_size}_T{delay}"
+        if delay * (DB6_DIM - 1) >= window_size:
+            print(f"  [{i}/{len(combos)}] {profile_name}: skipped (delay too large for window)")
+            continue
+        print(f"  [{i}/{len(combos)}] Running profile {profile_name} "
+              f"(window {window_size / DB6_FS * 1000:.1f} ms, delay {delay / DB6_FS * 1000:.1f} ms)")
+        t0 = time.time()
         df_profile = extract_db6_profile(
             t,
             acc,
             cart_mm,
             window_size=window_size,
+            delay=delay,
             progress_every=PROGRESS_EVERY_DB6,
         )
         profile_frames[profile_name] = df_profile
@@ -489,24 +521,29 @@ def run_dataset6(tag: str, filename: str):
         metadata_rows.append({
             "Profile": profile_name,
             "Dataset": tag,
+            "Legacy": window_size in DB6_LEGACY_WINDOWS and delay == DB6_LEGACY_DELAY,
             "Sampling_Hz": DB6_FS,
             "Lowpass_Hz": DB6_CUTOFF,
             "Filter_Order": DB6_FILTER_ORDER,
             "Window_Size": window_size,
+            "Window_ms": window_size / DB6_FS * 1000,
             "Window_Step": DB6_WINDOW_STEP,
-            "Takens_Delay": DB6_DELAY,
+            "Takens_Delay": delay,
+            "Delay_ms": delay / DB6_FS * 1000,
             "Takens_Dimension": DB6_DIM,
             "Takens_Stride": DB6_EMBED_STRIDE,
+            "Points_per_Window": (window_size - delay * (DB6_DIM - 1) - 1) // DB6_EMBED_STRIDE + 1,
             "Time_Label": "midpoint",
             "Rows": len(df_profile),
             "FastTDA_Invalid_Count": int((~df_profile["FastTDA_FitOK"]).sum()),
-            "Note": "W1500 tests old VR convention; W1612 tests old FTDA/formula convention",
+            **feature_summary(df_profile, "CartLocation"),
+            "Runtime_s": time.time() - t0,
         })
 
     with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
+        pd.DataFrame(metadata_rows).to_excel(writer, sheet_name="Metadata", index=False)
         for profile_name, df_profile in profile_frames.items():
             df_profile.to_excel(writer, sheet_name=profile_name[:31], index=False)
-        pd.DataFrame(metadata_rows).to_excel(writer, sheet_name="Metadata", index=False)
 
     print(f"  Saved: {out_path}")
     return out_path
@@ -543,11 +580,10 @@ def db8_window_and_tau(max_f: float):
     return window_size, tau
 
 
-def extract_db8_profile(t, acc, pinloc, max_f: float, progress_every=500):
+def extract_db8_profile(t, acc, pinloc, window_size: int, tau: int, progress_every=500):
     """
     DB8 extraction using the legacy TakensEmbedding batch convention.
     """
-    window_size, tau = db8_window_and_tau(max_f)
 
     acc_windows = create_windows(acc, window_size, DB8_WINDOW_STEP)
     pin_windows = create_windows(pinloc, window_size, DB8_WINDOW_STEP)
@@ -596,16 +632,15 @@ def extract_db8_profile(t, acc, pinloc, max_f: float, progress_every=500):
             "Window_Size": int(window_size),
             "Takens_Delay": int(tau),
             "Takens_Stride": int(DB8_EMBED_STRIDE),
-            "Max_F": float(max_f),
         })
 
         if progress_every and (k + 1) % progress_every == 0:
             print(
-                f"    DB8 W{window_size} S1: {k+1}/{len(embedded_windows)} windows "
+                f"    DB8 W{window_size}_T{tau}: {k+1}/{len(embedded_windows)} windows "
                 f"| feature elapsed {time.time()-t0:.1f} s"
             )
 
-    return pd.DataFrame(rows), window_size, tau
+    return pd.DataFrame(rows)
 
 
 def run_dataset8(tag: str, filename: str):
@@ -620,21 +655,27 @@ def run_dataset8(tag: str, filename: str):
 
     t, acc, pinloc = load_dataset8(input_path)
 
-    out_path = os.path.join(WORK_DIR, f"Code2_{tag}_DB8_ParityProfiles.xlsx")
+    out_path = os.path.join(WORK_DIR, f"Code2_{tag}_DB8_FineTune.xlsx")
 
     metadata_rows = []
     profile_frames = {}
 
-    for profile in DB8_PROFILES:
-        name = profile["name"]
-        max_f = float(profile["max_f"])
-
-        print(f"  Running profile {name} ({profile['legacy_role']})")
-        df_profile, window_size, tau = extract_db8_profile(
+    legacy = {db8_window_and_tau(f) for f in DB8_LEGACY_MAX_F}
+    combos = [(w, d) for w in DB8_WINDOW_SIZES for d in DB8_DELAYS]
+    for i, (window_size, tau) in enumerate(combos, 1):
+        name = f"W{window_size}_T{tau}"
+        if tau * (DB8_DIM - 1) >= window_size:
+            print(f"  [{i}/{len(combos)}] {name}: skipped (delay too large for window)")
+            continue
+        print(f"  [{i}/{len(combos)}] Running profile {name} "
+              f"(window {window_size / DB8_FS * 1000:.1f} ms, delay {tau / DB8_FS * 1000:.1f} ms)")
+        t0 = time.time()
+        df_profile = extract_db8_profile(
             t,
             acc,
             pinloc,
-            max_f=max_f,
+            window_size=window_size,
+            tau=tau,
             progress_every=PROGRESS_EVERY_DB8,
         )
         profile_frames[name] = df_profile
@@ -642,26 +683,29 @@ def run_dataset8(tag: str, filename: str):
         metadata_rows.append({
             "Profile": name,
             "Dataset": tag,
-            "Legacy_Role": profile["legacy_role"],
+            "Legacy": (window_size, tau) in legacy,
             "Sampling_Hz": DB8_FS,
             "Lowpass_Hz": DB8_CUTOFF,
             "Filter_Order": DB8_FILTER_ORDER,
-            "Min_F": DB8_MIN_F,
-            "Max_F": max_f,
             "Window_Size": window_size,
+            "Window_ms": window_size / DB8_FS * 1000,
             "Window_Step": DB8_WINDOW_STEP,
             "Takens_Delay": tau,
+            "Delay_ms": tau / DB8_FS * 1000,
             "Takens_Dimension": DB8_DIM,
             "Takens_Stride": DB8_EMBED_STRIDE,
+            "Points_per_Window": (window_size - tau * (DB8_DIM - 1) - 1) // DB8_EMBED_STRIDE + 1,
             "Time_Label": "endpoint",
             "Rows": len(df_profile),
             "FastTDA_Invalid_Count": int((~df_profile["FastTDA_FitOK"]).sum()),
+            **feature_summary(df_profile, "CartLocation"),
+            "Runtime_s": time.time() - t0,
         })
 
     with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
+        pd.DataFrame(metadata_rows).to_excel(writer, sheet_name="Metadata", index=False)
         for profile_name, df_profile in profile_frames.items():
             df_profile.to_excel(writer, sheet_name=profile_name[:31], index=False)
-        pd.DataFrame(metadata_rows).to_excel(writer, sheet_name="Metadata", index=False)
 
     print(f"  Saved: {out_path}")
     return out_path
@@ -676,9 +720,11 @@ def main():
     print("DROPBEAR Code 2: Feature-extraction parity profiles")
     print("=" * 80)
     print(f"WORK_DIR: {WORK_DIR}")
-    print("No current feature Excel files will be overwritten.")
-    print("DB6 profiles: W1500 and W1612")
-    print("DB8 profiles: W362/S1/max_f31.1 and W363/S1/max_f31.0")
+    print("Outputs are written as *_FineTune.xlsx (parity files are not overwritten).")
+    print(f"DB6 grid: windows {DB6_WINDOW_SIZES} x delays {DB6_DELAYS} "
+          f"({len(DB6_WINDOW_SIZES) * len(DB6_DELAYS)} profiles per file)")
+    print(f"DB8 grid: windows {DB8_WINDOW_SIZES} x delays {DB8_DELAYS} "
+          f"({len(DB8_WINDOW_SIZES) * len(DB8_DELAYS)} profiles)")
     print(f"Alpha enabled: {COMPUTE_ALPHA}")
     print("=" * 80)
 
