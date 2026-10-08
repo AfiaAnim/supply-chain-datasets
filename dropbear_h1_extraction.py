@@ -1,0 +1,137 @@
+"""
+Extract max H1 persistence features from DROPBEAR trial data and save them to Excel.
+
+Requirements (Python 3.8 - 3.11 recommended; giotto-tda has no wheels for newer versions):
+    pip install numpy pandas scipy scikit-learn giotto-tda openpyxl
+"""
+import os
+import time
+
+import numpy as np
+import pandas as pd
+from gtda.homology import VietorisRipsPersistence
+from gtda.time_series import TakensEmbedding
+from scipy import signal
+from sklearn.preprocessing import MinMaxScaler
+
+
+# === Signal Processing ===
+def process_signal(data, pass_value=100, fs=5000):
+    N = 6
+    low_g_acc = data[:, 0] * 1000 / 102
+    acc = data[:, 3]
+    pinloc = data[:, 4] / 17.18
+    t = data[:, 5].reshape(-1, 1)
+
+    sos = signal.butter(N=N, Wn=pass_value, btype='lowpass', fs=fs, output='sos')
+    low_g_acc_filt = signal.sosfiltfilt(sos, low_g_acc).reshape(-1, 1)
+    acc_filt = signal.sosfiltfilt(sos, acc).reshape(-1, 1)
+    pinloc_filt = signal.sosfiltfilt(sos, pinloc).reshape(-1, 1)
+
+    return np.hstack((low_g_acc_filt, acc_filt, pinloc_filt, t))
+
+
+# === Create Sliding Windows ===
+def create_windows(array, window_size, step):
+    # Strided view instead of a Python list -> much faster and lighter on memory
+    windows = np.lib.stride_tricks.sliding_window_view(array, window_size)
+    return windows[::step]
+
+
+# === Normalize each window to [-1, 1] ===
+def min_max_scale(array):
+    scaler = MinMaxScaler((-1, 1))
+    return scaler.fit_transform(array)
+
+
+# === Takens Embedding ===
+def takens_embedding(array, delay, dimension, stride):
+    embedder = TakensEmbedding(time_delay=delay, dimension=dimension, stride=stride)
+    return embedder.fit_transform(array)
+
+
+# === Extract H1 Persistence ===
+def extract_h1_persistence(embedded_windows, n_jobs=-1):
+    tda = VietorisRipsPersistence(homology_dimensions=(1,), n_jobs=n_jobs)
+    diagrams = tda.fit_transform(embedded_windows)
+    # diagrams: (n_windows, n_points, 3) -> [birth, death, homology_dim]
+    h1_persistence = np.max(diagrams[:, :, 1] - diagrams[:, :, 0], axis=1)
+    return h1_persistence
+
+
+# === Main Extraction Function ===
+def extract_dropbear_h1_excel(data_id, trial_id, set_id, freq, max_f, min_f, s, s_W,
+                              pass_value, base_path, output_path, n_jobs=-1):
+    start_time = time.time()
+
+    path = os.path.join(base_path, "Random Index Set Random Dwell", f"set{set_id}",
+                        "trial data", f"test{trial_id}.txt")
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"Data file not found: {path}")
+
+    print(f"Loading: {path}")
+    data = np.loadtxt(path, skiprows=9)
+    if data.ndim != 2 or data.shape[1] < 6:
+        raise ValueError(f"Expected at least 6 columns in data file, got shape {data.shape}")
+
+    processed = process_signal(data, pass_value=pass_value, fs=freq)
+
+    acc = processed[:, 1]
+    pinloc = processed[:, 2]
+    time_array = processed[:, 3]
+
+    h1_window_size = int(((1 / min_f) + (0.25 / max_f) * 2) * freq)
+    tau = max(1, int((0.25 / max_f) * freq / 2))
+    print(f"Window size: {h1_window_size} samples, tau: {tau}, window step: {s_W}")
+
+    if len(acc) < h1_window_size:
+        raise ValueError(f"Signal length ({len(acc)}) is shorter than window size ({h1_window_size})")
+
+    acc_windows = create_windows(acc, h1_window_size, s_W)
+    pinloc_windows = create_windows(pinloc, h1_window_size, s_W)
+    time_windows = create_windows(time_array, h1_window_size, s_W)
+    print(f"Number of windows: {len(acc_windows)}")
+
+    scaled_windows = np.array([min_max_scale(w.reshape(-1, 1)).flatten() for w in acc_windows])
+    embedded_windows = takens_embedding(scaled_windows, delay=tau, dimension=2, stride=s)
+
+    print("Computing Vietoris-Rips persistence (this can take a while)...")
+    max_h1 = extract_h1_persistence(embedded_windows, n_jobs=n_jobs)
+
+    df = pd.DataFrame({
+        'Time': time_windows[:, -1],
+        'pinloc': pinloc_windows[:, -1],
+        'Max H1': max_h1
+    })
+
+    duration = (time.time() - start_time) / len(df) * 1000
+    print(f"Extraction complete: {len(df)} windows")
+    print(f"Average time per window: {duration:.2f} ms")
+
+    os.makedirs(output_path, exist_ok=True)
+    output_file = os.path.join(output_path, f"H1_Features_set{set_id}_trial{trial_id}_freq{max_f}.xlsx")
+    df.to_excel(output_file, index=False)
+    print(f"Results saved to: {output_file}")
+
+    return df
+
+
+# The __main__ guard is required on Windows when n_jobs != 1 (joblib spawns worker processes)
+if __name__ == "__main__":
+    # === Parameters ===
+    data_id = 2
+    trial_id = 1
+    set_id = 4
+    freq = 5000
+    max_f = 31.1
+    min_f = 17.7
+    s = 1
+    s_W = 5
+    pass_value = 100
+
+    base_path = r"C:/Users/daniel94/Code/42th Journal Publication Dropbear 8/0. BASE DATASET 8/DROPBEAR_Full dataset 8/data"
+    output_path = r"C:/Users/daniel94/Code/43 full content Journal Paper/1 fundamental Freq/4. Dropbear Dataset 8"
+
+    # === Run ===
+    extract_dropbear_h1_excel(data_id, trial_id, set_id, freq, max_f, min_f, s, s_W,
+                              pass_value, base_path, output_path)
