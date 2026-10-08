@@ -6,6 +6,7 @@ Requirements (Python 3.8 - 3.11 recommended; giotto-tda has no wheels for newer 
 """
 import os
 import time
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -60,13 +61,12 @@ def extract_h1_persistence(embedded_windows, n_jobs=-1):
 
 
 # === Main Extraction Function ===
-def extract_dropbear_h1_excel(data_id, trial_id, set_id, freq, max_f, min_f, s, s_W,
-                              pass_value, base_path, output_path, n_jobs=-1):
+def extract_dropbear_h1_excel(data_path, freq, max_f, min_f, s, s_W,
+                              pass_value, output_path, n_jobs=-1):
     start_time = time.time()
 
-    path = os.path.join(base_path, "Random Index Set Random Dwell", f"set{set_id}",
-                        "trial data", f"test{trial_id}.txt")
-    if not os.path.isfile(path):
+    path = Path(data_path)
+    if not path.is_file():
         raise FileNotFoundError(f"Data file not found: {path}")
 
     print(f"Loading: {path}")
@@ -109,7 +109,7 @@ def extract_dropbear_h1_excel(data_id, trial_id, set_id, freq, max_f, min_f, s, 
     print(f"Average time per window: {duration:.2f} ms")
 
     os.makedirs(output_path, exist_ok=True)
-    output_file = os.path.join(output_path, f"H1_Features_set{set_id}_trial{trial_id}_freq{max_f}.xlsx")
+    output_file = os.path.join(output_path, f"H1_Features_{path.stem}_freq{max_f}.xlsx")
     df.to_excel(output_file, index=False)
     print(f"Results saved to: {output_file}")
 
@@ -119,9 +119,6 @@ def extract_dropbear_h1_excel(data_id, trial_id, set_id, freq, max_f, min_f, s, 
 # The __main__ guard is required on Windows when n_jobs != 1 (joblib spawns worker processes)
 if __name__ == "__main__":
     # === Parameters ===
-    data_id = 2
-    trial_id = 1
-    set_id = 4
     freq = 5000
     max_f = 31.1
     min_f = 17.7
@@ -129,9 +126,9 @@ if __name__ == "__main__":
     s_W = 5
     pass_value = 100
 
-    base_path = r"C:/Users/daniel94/Code/42th Journal Publication Dropbear 8/0. BASE DATASET 8/DROPBEAR_Full dataset 8/data"
-    output_path = r"C:/Users/daniel94/Code/43 full content Journal Paper/1 fundamental Freq/4. Dropbear Dataset 8"
+    data_path = Path("/mnt/c/Users/aphya/Downloads/DROPBEAR_Barbara.txt")
+    output_path = data_path.parent  # Excel file is saved next to the data file
 
     # === Run ===
-    extract_dropbear_h1_excel(data_id, trial_id, set_id, freq, max_f, min_f, s, s_W,
-                              pass_value, base_path, output_path)
+    extract_dropbear_h1_excel(data_path, freq, max_f, min_f, s, s_W,
+                              pass_value, output_path)
