@@ -176,7 +176,7 @@ if __name__ == "__main__":
     window_size = 362
     tau = 20
 
-    data_path = Path("/mnt/c/Users/aphya/Downloads/DROPBEAR_Barbara.txt")
+    data_path = Path("/mnt/c/Users/aphya/Downloads/test1.txt")
     output_path = data_path.parent  # Excel file is saved next to the data file
 
     # === Run ===
