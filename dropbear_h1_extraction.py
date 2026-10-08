@@ -95,7 +95,7 @@ def extract_h1_persistence(embedded_windows, n_jobs=-1):
 
 # === Main Extraction Function ===
 def extract_dropbear_h1_excel(data_path, freq, max_f, min_f, s, s_W,
-                              pass_value, output_path, n_jobs=-1):
+                              pass_value, output_path, window_size=None, tau=None, n_jobs=-1):
     start_time = time.time()
 
     path = Path(data_path)
@@ -111,9 +111,21 @@ def extract_dropbear_h1_excel(data_path, freq, max_f, min_f, s, s_W,
     pinloc = processed[:, 2]
     time_array = processed[:, 3]
 
-    h1_window_size = int(((1 / min_f) + (0.25 / max_f) * 2) * freq)
-    tau = max(1, int((0.25 / max_f) * freq / 2))
-    print(f"Window size: {h1_window_size} samples, tau: {tau}, window step: {s_W}")
+    # Window size and time delay: use the values given, otherwise compute from the frequencies
+    if window_size is None:
+        h1_window_size = int(((1 / min_f) + (0.25 / max_f) * 2) * freq)
+    else:
+        h1_window_size = int(window_size)
+    if tau is None:
+        tau = max(1, int((0.25 / max_f) * freq / 2))
+    else:
+        tau = int(tau)
+    if tau < 1:
+        raise ValueError(f"tau must be at least 1, got {tau}")
+    if tau >= h1_window_size:
+        raise ValueError(f"tau ({tau}) must be smaller than the window size ({h1_window_size})")
+    print(f"Window size: {h1_window_size} samples ({h1_window_size / freq * 1000:.1f} ms), "
+          f"tau: {tau} samples ({tau / freq * 1000:.1f} ms), window step: {s_W}")
 
     if len(acc) < h1_window_size:
         raise ValueError(f"Signal length ({len(acc)}) is shorter than window size ({h1_window_size})")
@@ -140,7 +152,7 @@ def extract_dropbear_h1_excel(data_path, freq, max_f, min_f, s, s_W,
     print(f"Average time per window: {duration:.2f} ms")
 
     os.makedirs(output_path, exist_ok=True)
-    output_file = os.path.join(output_path, f"H1_Features_{path.stem}_freq{max_f}.xlsx")
+    output_file = os.path.join(output_path, f"H1_Features_{path.stem}_win{h1_window_size}_tau{tau}.xlsx")
     df.to_excel(output_file, index=False)
     print(f"Results saved to: {output_file}")
 
@@ -157,9 +169,16 @@ if __name__ == "__main__":
     s_W = 5
     pass_value = 100
 
+    # === Window size and time delay (in samples; 5000 samples = 1 s) ===
+    # Set to None to compute automatically from min_f / max_f:
+    #   window_size = ((1 / min_f) + 2 * (0.25 / max_f)) * freq  -> 362 samples
+    #   tau         = (0.25 / max_f) * freq / 2                  -> 20 samples
+    window_size = 362
+    tau = 20
+
     data_path = Path("/mnt/c/Users/aphya/Downloads/DROPBEAR_Barbara.txt")
     output_path = data_path.parent  # Excel file is saved next to the data file
 
     # === Run ===
     extract_dropbear_h1_excel(data_path, freq, max_f, min_f, s, s_W,
-                              pass_value, output_path)
+                              pass_value, output_path, window_size=window_size, tau=tau)
