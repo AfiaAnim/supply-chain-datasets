@@ -59,14 +59,34 @@ def lowpass(x, pass_value, fs, N=6):
     return signal.sosfiltfilt(sos, x)
 
 
-def process_signal(data, time_col, acc_col, pinloc_col, pinloc_scale, pass_value, freq):
+def process_signal(data, time_col, acc_col, pinloc_col, pinloc_scale, pass_value, freq, raw_fs=None):
     """Low-pass filter the signals and resample them to `freq` Hz.
 
+    raw_fs is the file's sampling rate in Hz; if None it is estimated from the time column.
     Returns (acc, pinloc, time) at `freq` Hz. pinloc is None if pinloc_col is None.
     """
-    t = data[:, time_col]
-    raw_fs = 1.0 / np.median(np.diff(t))
-    print(f"Detected sampling rate from time column: {raw_fs:.0f} Hz")
+    n = data.shape[0]
+    t = data[:, time_col] if time_col is not None else None
+
+    if raw_fs is None:
+        if t is None:
+            raise ValueError("Set raw_fs (sampling rate in Hz) when there is no time column.")
+        span = t[-1] - t[0]
+        if not np.isfinite(span) or span <= 0:
+            raise ValueError("Could not estimate the sampling rate from the time column "
+                             f"(first={t[0]}, last={t[-1]}). Set raw_fs, e.g. raw_fs = 25000.")
+        raw_fs = (n - 1) / span
+        print(f"Estimated sampling rate from time column: {raw_fs:.0f} Hz")
+    else:
+        print(f"Using sampling rate: {raw_fs:.0f} Hz")
+
+    # If the time column is missing or not strictly increasing, rebuild it from the sampling rate
+    if t is None or np.any(np.diff(t) <= 0):
+        if t is not None:
+            n_bad = int(np.sum(np.diff(t) <= 0))
+            print(f"Warning: time column has {n_bad} repeated/decreasing values -> "
+                  f"rebuilding time as sample_index / {raw_fs:.0f}")
+        t = np.arange(n) / raw_fs
 
     acc = lowpass(data[:, acc_col], pass_value, raw_fs)
     pinloc = None
@@ -118,7 +138,8 @@ def extract_h1_persistence(embedded_windows, n_jobs=-1):
 # === Main Extraction Function ===
 def extract_dropbear_h1_excel(data_path, freq, max_f, min_f, s, s_W,
                               pass_value, output_path, window_size=None, tau=None,
-                              time_col=0, acc_col=1, pinloc_col=None, pinloc_scale=1.0, n_jobs=-1):
+                              time_col=0, acc_col=1, pinloc_col=None, pinloc_scale=1.0,
+                              raw_fs=None, n_jobs=-1):
     start_time = time.time()
 
     path = Path(data_path)
@@ -130,7 +151,7 @@ def extract_dropbear_h1_excel(data_path, freq, max_f, min_f, s, s_W,
     data = load_numeric_data(path, min_cols=max(used_cols) + 1)
 
     acc, pinloc, time_array = process_signal(data, time_col, acc_col, pinloc_col,
-                                             pinloc_scale, pass_value, freq)
+                                             pinloc_scale, pass_value, freq, raw_fs=raw_fs)
 
     # Window size and time delay: use the values given, otherwise compute from the frequencies
     if window_size is None:
@@ -191,6 +212,9 @@ if __name__ == "__main__":
     pinloc_col = None    # pin location column, or None if the file has none
     pinloc_scale = 1.0   # multiply pin location by this (old DROPBEAR files used 1 / 17.18)
 
+    # === Sampling rate of the file in Hz (None = estimate from the time column) ===
+    raw_fs = 25000       # your files step 0.00004 s per row -> 25000 Hz
+
     # === Parameters ===
     freq = 5000          # analysis rate in Hz; data is downsampled to this after filtering
     max_f = 31.1
@@ -210,4 +234,4 @@ if __name__ == "__main__":
     extract_dropbear_h1_excel(data_path, freq, max_f, min_f, s, s_W,
                               pass_value, output_path, window_size=window_size, tau=tau,
                               time_col=time_col, acc_col=acc_col,
-                              pinloc_col=pinloc_col, pinloc_scale=pinloc_scale)
+                              pinloc_col=pinloc_col, pinloc_scale=pinloc_scale, raw_fs=raw_fs)
