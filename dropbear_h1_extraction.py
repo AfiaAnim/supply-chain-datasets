@@ -16,6 +16,39 @@ from scipy import signal
 from sklearn.preprocessing import MinMaxScaler
 
 
+# === Load Data ===
+def load_numeric_data(path, min_cols=6):
+    """Read only the numeric rows of a text file, skipping any header/description text.
+
+    Works with space, tab, comma or semicolon separated values.
+    """
+    rows = []
+    preview = []
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if len(preview) < 15:
+                preview.append(line.rstrip())
+            parts = line.replace(",", " ").replace(";", " ").split()
+            if len(parts) < min_cols:
+                continue
+            try:
+                rows.append([float(p) for p in parts])
+            except ValueError:
+                continue  # text line (header, notes, column names) -> skip
+
+    if not rows:
+        raise ValueError(
+            f"No rows with at least {min_cols} numeric columns found in {path}.\n"
+            "First lines of the file:\n" + "\n".join(preview)
+        )
+
+    # Keep rows with the most common column count (drops stray partial lines)
+    n_cols = max(set(len(r) for r in rows), key=[len(r) for r in rows].count)
+    data = np.array([r for r in rows if len(r) == n_cols])
+    print(f"Loaded {data.shape[0]} rows x {data.shape[1]} columns")
+    return data
+
+
 # === Signal Processing ===
 def process_signal(data, pass_value=100, fs=5000):
     N = 6
@@ -70,9 +103,7 @@ def extract_dropbear_h1_excel(data_path, freq, max_f, min_f, s, s_W,
         raise FileNotFoundError(f"Data file not found: {path}")
 
     print(f"Loading: {path}")
-    data = np.loadtxt(path, skiprows=9)
-    if data.ndim != 2 or data.shape[1] < 6:
-        raise ValueError(f"Expected at least 6 columns in data file, got shape {data.shape}")
+    data = load_numeric_data(path, min_cols=6)
 
     processed = process_signal(data, pass_value=pass_value, fs=freq)
 
