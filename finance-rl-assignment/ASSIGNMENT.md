@@ -2,9 +2,9 @@
 
 **Topic:** Function approximation in RL (linear SARSA with RBF features vs Deep Q-Networks)
 **Application:** Automated trade execution, portfolio management and risk assessment
-**Language:** R (base R + the `torch` package)
+**Language:** Python 3.10+ (`numpy`, `pandas`, `matplotlib>=3.10`, `torch`)
 **Estimated effort:** 10–12 hours  **Total:** 100 points
-**Starter code:** [`trade_execution_rl.R`](trade_execution_rl.R)
+**Starter code:** [`trade_execution_rl.py`](trade_execution_rl.py) (an equivalent R version, [`trade_execution_rl.R`](trade_execution_rl.R), is also provided)
 
 ---
 
@@ -43,9 +43,9 @@ A desk must sell a large block of shares (for example, 500,000) before the close
 
 | # | Action | Child size `q` | Fill probability | Spread | Market impact |
 |---|---|---|---|---|---|
-| 1 | Passive (limit order) | 3 % | 50 % | *earn* the half-spread | none |
-| 2 | Moderate (TWAP slice) | 6 % | 100 % | pay the half-spread | `η·q` per unit |
-| 3 | Aggressive (market order) | 15 % | 100 % | pay the half-spread | `η·q` per unit |
+| 0 | Passive (limit order) | 3 % | 50 % | *earn* the half-spread | none |
+| 1 | Moderate (TWAP slice) | 6 % | 100 % | pay the half-spread | `η·q` per unit |
+| 2 | Aggressive (market order) | 15 % | 100 % | pay the half-spread | `η·q` per unit |
 
 **Reward at each interval:**
 
@@ -53,7 +53,7 @@ $$
 r_t = -\underbrace{q\,(\pm s + \eta\, q)}_{\text{execution cost}} \;+\; \underbrace{(1-x_{t+1})\,\sigma\,\varepsilon_t}_{\text{mark-to-market P\&L}} \;-\; \underbrace{\lambda\,(1-x_{t+1})}_{\text{inventory-risk penalty}}, \qquad \varepsilon_t \sim N(0,1)
 $$
 
-where `s = half_spread_bps`, `η = impact_bps`, `σ = sigma_bps` and `λ = risk_aversion` (all set in the `mkt` list).
+where `s = half_spread_bps`, `η = impact_bps`, `σ = sigma_bps` and `λ = risk_aversion` (all set in the `MKT` dictionary).
 
 **Termination:** the episode ends when the order is fully executed. If the order is still open after `max_steps` intervals, the remainder is sold in a single market order, which has a very large impact cost.
 
@@ -70,23 +70,26 @@ This is a stylised, single-asset version of the **Almgren–Chriss (2000)** opti
 
 ### 2.3 Running it
 
-```r
-# One-time setup for the DQN part
-install.packages("torch"); torch::install_torch()
+```bash
+pip install numpy pandas "matplotlib>=3.10" torch
 
-source("trade_execution_rl.R")
+python trade_execution_rl.py
 ```
 
-The SARSA agent and the benchmarks need only base R and run in a few seconds. If `torch` is missing, the DQN is skipped with a message.
+The SARSA agent and the benchmarks need only `numpy`, `pandas` and `matplotlib`. The whole script runs in about 15 seconds on a laptop CPU. If `torch` is missing, the DQN is skipped with a message.
 
-As a sanity check, with the default parameters and `set.seed(42)` your risk table should look roughly like this (exact values vary slightly by platform):
+As a sanity check, with the default parameters and `SEED = 42` your risk table should look roughly like this (exact values vary slightly by platform):
 
 | Policy | Mean reward | Mean IS (bps) | VaR95 (bps) | CVaR95 (bps) | % forced at close |
 |---|---|---|---|---|---|
-| All Passive | ≈ −66 | ≈ 1 | ≈ 28 | ≈ 34 | ≈ 79 |
-| TWAP (Moderate) | ≈ −33 | ≈ 18 | ≈ 28 | ≈ 30 | 0 |
-| All Aggressive | ≈ −40 | ≈ 34 | ≈ 41 | ≈ 42 | 0 |
-| Linear SARSA | ≈ −31 | ≈ 16 | ≈ 26 | ≈ 27 | 0 |
+| All Passive | ≈ −66 | ≈ 1 | ≈ 25 | ≈ 33 | ≈ 80 |
+| TWAP (Moderate) | ≈ −33 | ≈ 17 | ≈ 28 | ≈ 30 | 0 |
+| All Aggressive | ≈ −40 | ≈ 34 | ≈ 41 | ≈ 43 | 0 |
+| Front-loaded | ≈ −32 | ≈ 22 | ≈ 30 | ≈ 32 | 0 |
+| Linear SARSA | ≈ −31 | ≈ 11 | ≈ 23 | ≈ 26 | 0 |
+| Deep DQN | ≈ −33 | ≈ 22 | ≈ 29 | ≈ 32 | 0 |
+
+The learned policies, and the DQN in particular, change noticeably with the seed. That is part of what Task 2 asks you to investigate.
 
 ---
 
@@ -126,10 +129,10 @@ Re-train the SARSA agent (and the DQN if you have it) under each regime below. C
 
 ### Task 4: Portfolio-management extension (20 pts)
 
-Implement `step_env_portfolio(state, action, t, mkt)` (stub at the bottom of the script). It must keep the **same interface** as `step_env` so both agents can be reused unchanged.
+Implement `step_env_portfolio(state, action, t, mkt, rng)` (stub at the bottom of the script). It must keep the **same interface** as `step_env` so both agents can be reused unchanged.
 
 - **State:** equity weight `w ∈ [0, 1]`; the rest is held in cash or bonds.
-- **Actions:** 1 = de-risk (`w − 0.10`), 2 = hold, 3 = re-risk (`w + 0.10`). Clip to [0, 1].
+- **Actions:** 0 = de-risk (`w − 0.10`), 1 = hold, 2 = re-risk (`w + 0.10`). Clip to [0, 1].
 - **Returns:** simulate daily equity returns from a **two-regime** model, with "calm" (μ = 0.05 %, σ = 0.8 %) and "stressed" (μ = −0.10 %, σ = 2.5 %) regimes and a 2 % daily switching probability. Use a cash return of 0.01 % per day.
 - **Reward:** `w·r_eq + (1 − w)·r_cash − c·|Δw| − λ·w²·σ²`, with transaction cost `c = 10 bps`.
 - **Episode:** 252 trading days.
@@ -155,10 +158,10 @@ Write a report of at most 6 pages (plots and tables included). It must contain t
 
 ## 4. Deliverables
 
-1. `trade_execution_rl.R` with your modifications. It must run top to bottom with `source()`, and any new code must be clearly commented with `# Task X`.
-2. `portfolio_rl.R` (or a clearly marked section) for Task 4.
+1. `trade_execution_rl.py` with your modifications. It must run top to bottom with `python trade_execution_rl.py`, and any new code must be clearly commented with `# Task X`.
+2. `portfolio_rl.py` (or a clearly marked section) for Task 4.
 3. `report.pdf`.
-4. Fix `set.seed()` everywhere so that your numbers can be reproduced.
+4. Fix seeds everywhere (`np.random.default_rng(seed)`, `torch.manual_seed(seed)`, `random.seed(seed)`) so that your numbers can be reproduced.
 
 ## 5. Grading rubric
 
@@ -172,10 +175,12 @@ Write a report of at most 6 pages (plots and tables included). It must contain t
 
 ## 6. Hints
 
-- Keep features in [0, 1]. If you add **time-to-close** as a second state variable (a great bonus idea for Task 1.4), use a 2-D RBF grid, for example `expand.grid` over 8 × 8 centres.
-- In R `torch`, `torch_argmax` returns **1-based** indices, so it maps directly to actions 1–3.
-- Wrap evaluation-time network calls in `with_no_grad()` so no autograd graph is built.
-- When comparing policies, always reuse the same seed in `evaluate_policy()`. Otherwise differences may just be market noise.
+- Keep features in [0, 1]. If you add **time-to-close** as a second state variable (a great bonus idea for Task 1.4), use a 2-D RBF grid, for example `np.meshgrid` over 8 × 8 centres.
+- Actions are **0-based** (0, 1, 2), so `model(x).argmax(dim=1)` maps directly to an action.
+- Wrap evaluation-time network calls in `with torch.no_grad():` so no autograd graph is built.
+- For the replay buffer, `collections.deque(maxlen=5000)` plus `random.sample(buffer, 32)` is enough. Stack each mini-batch into tensors and compute all 32 TD targets in one forward pass.
+- Pass a `numpy.random.Generator` (`rng`) into every function that draws random numbers, as the starter code does, instead of using the global `np.random` state.
+- When comparing policies, always reuse the same `seed` in `evaluate_policy()`. Otherwise differences may just be market noise.
 
 ## 7. References
 
