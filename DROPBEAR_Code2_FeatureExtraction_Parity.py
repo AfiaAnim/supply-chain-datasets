@@ -66,6 +66,16 @@ default grids as baselines (marked Legacy=True in the Metadata sheet). The
 Metadata sheet also lists per-profile feature statistics and the correlation
 of each feature with the cart/pin location for quick comparison.
 
+CSV trial (FastTDA analysis)
+----------------------------
+Any single trial saved as .csv (e.g. trial_01.csv) can be run through the same
+window x delay fine-tuning grid. The loader detects the delimiter, the header,
+the time / acceleration / position columns and the sampling rate, and prints a
+column summary so the choice can be checked; each can also be set by hand in
+the CSV configuration block. Window, delay and step are given in milliseconds,
+so the grid means the same thing at any sampling rate. FastTDA is always
+computed; VR and Alpha are optional (CSV_COMPUTE_VR / CSV_COMPUTE_ALPHA).
+
 IMPORTANT
 ---------
 This code only extracts features. It does not clip/normalize features for
@@ -142,6 +152,50 @@ DB8_WINDOW_SIZES = [322, 362, 402]
 DB8_DELAYS = [15, 20, 25]
 DB8_LEGACY_MAX_F = (31.1, 31.0)
 
+# ============================================================
+# WHAT TO RUN
+# ============================================================
+
+RUN_DB6 = False
+RUN_DB8 = False
+RUN_CSV = True
+
+# ============================================================
+# CSV TRIAL CONFIGURATION (FastTDA analysis)
+# ============================================================
+
+# Windows paths (C:\...) are converted to WSL paths (/mnt/c/...) automatically.
+CSV_PATH = r"C:\Users\aphya\Downloads\trial_01.csv"
+CSV_OUTPUT_DIR = None        # None = save next to the CSV
+
+# Columns: a header name or a 0-based index.
+# trial_01.csv columns: time_s, capacitance_raw_pF, capacitance_zero_mean_pF,
+#                       capacitance_filtered_pF, capacitance_filtered_zero_mean_pF
+# (a leading unnamed row-index column, if present, is ignored).
+CSV_TIME_COL = "time_s"
+CSV_SIGNAL_COL = "capacitance_filtered_pF"   # signal analysed with FastTDA
+CSV_POS_COL = None                           # position/label column, or None if there is none
+
+CSV_FS = None                # sampling rate in Hz; None = estimate from the time column (~88.5 Hz)
+CSV_CUTOFF = None            # extra low-pass cutoff (Hz); None = no extra filtering.
+                             # Must be below half the sampling rate (~44 Hz). Use e.g. 5 with
+                             # CSV_SIGNAL_COL = "capacitance_raw_pF" to filter the raw signal here.
+CSV_FILTER_ORDER = 6         # zero-phase Butterworth (SOS), as in DB8
+CSV_DIM = 2
+
+# Fine-tuning grid in SECONDS (converted to samples at the sampling rate).
+# Every window length is run with every delay. The script prints the dominant
+# frequency of the signal and the DB8-rule suggestion to guide these values:
+#   window ~ 1/min_f + 2*(0.25/max_f),  delay ~ (0.25/max_f)/2
+CSV_WINDOW_S = [1.0, 1.5, 2.0]
+CSV_DELAY_S = [0.03, 0.06, 0.09]
+CSV_STEP_SAMPLES = 1         # window step in samples (1 sample ~ 11 ms here)
+CSV_EMBED_STRIDE = 1         # samples between embedded points
+
+CSV_COMPUTE_VR = False       # VR max H1 (slower)
+CSV_COMPUTE_ALPHA = False    # Alpha max H1 (slowest; needs gudhi)
+PROGRESS_EVERY_CSV = 2000
+
 # Alpha can be much slower than VR/FastTDA for thousands of windows.
 # Keep True for the requested 3-method parity extraction.
 COMPUTE_ALPHA = True
@@ -177,13 +231,15 @@ def minmax_to_50_200(x: np.ndarray) -> np.ndarray:
     return 50.0 + (x - lo) * 150.0 / (hi - lo)
 
 
-def feature_summary(df: pd.DataFrame, label_col: str) -> dict:
+def feature_summary(df: pd.DataFrame, label_col) -> dict:
     """Per-profile statistics used to compare fine-tuning combinations."""
     out = {}
     for col in ("VR", "Alpha", "FastTDA"):
         x = df[col].astype(float)
         out[f"{col}_mean"] = float(np.nanmean(x)) if x.notna().any() else np.nan
         out[f"{col}_std"] = float(np.nanstd(x)) if x.notna().any() else np.nan
+        if label_col is None or label_col not in df:
+            continue
         ok = x.notna() & df[label_col].notna()
         if ok.sum() > 2 and x[ok].std() > 0 and df.loc[ok, label_col].std() > 0:
             out[f"Corr_{col}_{label_col}"] = float(np.corrcoef(x[ok], df.loc[ok, label_col])[0, 1])
@@ -712,6 +768,212 @@ def run_dataset8(tag: str, filename: str):
 
 
 # ============================================================
+# CSV TRIAL (FastTDA analysis)
+# ============================================================
+
+def to_local_path(path: str) -> str:
+    """Convert C:\\... to /mnt/c/... when running under Linux/WSL."""
+    path = str(path).strip().strip('"')
+    if os.name != "nt" and len(path) > 2 and path[1] == ":" and path[2] in "\\/":
+        drive = path[0].lower()
+        rest = path[3:].replace("\\", "/")
+        return f"/mnt/{drive}/{rest}"
+    return path
+
+
+def _resolve_column(df: pd.DataFrame, spec, what: str):
+    if spec is None:
+        return None
+    if isinstance(spec, int):
+        return df.columns[spec]
+    if spec in df.columns:
+        return spec
+    raise KeyError(f"{what} column {spec!r} not found. Columns in the file: {list(df.columns)}")
+
+
+def load_csv_trial(path: str):
+    # Delimiter from the header line; a leading unnamed column (saved row index) is dropped
+    with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
+        first = f.readline()
+    counts = {d: first.count(d) for d in (",", ";", "\t")}
+    sep = max(counts, key=counts.get) if max(counts.values()) > 0 else r"\s+"
+
+    df = pd.read_csv(path, sep=sep, engine="python", encoding="utf-8-sig")
+    df.columns = [str(c).strip() for c in df.columns]
+    df = df.loc[:, [c for c in df.columns if not c.startswith("Unnamed")]]
+    df = df.apply(pd.to_numeric, errors="coerce").dropna(axis=1, how="all").dropna(axis=0, how="any")
+    df = df.reset_index(drop=True)
+
+    print(f"  Loaded {len(df)} rows x {df.shape[1]} numeric columns (delimiter {sep!r})")
+    for col in df.columns:
+        c = df[col]
+        print(f"    {str(col)[:36]:36s} min={c.min():.6g}  max={c.max():.6g}  std={c.std():.4g}")
+
+    time_col = _resolve_column(df, CSV_TIME_COL, "Time")
+    sig_col = _resolve_column(df, CSV_SIGNAL_COL, "Signal")
+    pos_col = _resolve_column(df, CSV_POS_COL, "Position")
+    print(f"  Using: time={time_col!r}, signal={sig_col!r}, position={pos_col!r}")
+
+    t = df[time_col].to_numpy(dtype=float)
+    x = df[sig_col].to_numpy(dtype=float)
+    pos = df[pos_col].to_numpy(dtype=float) if pos_col is not None else None
+
+    if CSV_FS is not None:
+        fs = float(CSV_FS)
+    else:
+        span = t[-1] - t[0]
+        if not np.isfinite(span) or span <= 0:
+            raise ValueError("Could not estimate the sampling rate from the time column; set CSV_FS.")
+        fs = (len(t) - 1) / span
+    if np.any(np.diff(t) <= 0):
+        print(f"  Warning: time column is not strictly increasing; rebuilding it as sample/{fs:.2f}")
+        t = t[0] + np.arange(len(t)) / fs
+    print(f"  Sampling rate: {fs:.2f} Hz ({'set' if CSV_FS else 'estimated from time column'}), "
+          f"duration {len(t) / fs:.1f} s")
+
+    if CSV_CUTOFF is not None:
+        if CSV_CUTOFF >= fs / 2:
+            raise ValueError(f"CSV_CUTOFF ({CSV_CUTOFF} Hz) must be below half the sampling rate "
+                             f"({fs / 2:.1f} Hz), or set CSV_CUTOFF = None.")
+        sos = signal.butter(N=CSV_FILTER_ORDER, Wn=CSV_CUTOFF, btype="lowpass", fs=fs, output="sos")
+        x = signal.sosfiltfilt(sos, x)
+        if pos is not None:
+            pos = signal.sosfiltfilt(sos, pos)
+        print(f"  Low-pass filtered at {CSV_CUTOFF} Hz")
+
+    report_spectrum(x, fs)
+    return t, x, pos, fs, (pos_col or None)
+
+
+def report_spectrum(x: np.ndarray, fs: float, min_hz: float = 0.2):
+    """Print the dominant oscillation frequency and the DB8-rule window/delay it implies."""
+    nperseg = int(min(len(x), max(256, 20 * fs)))
+    f, pxx = signal.welch(x - np.mean(x), fs=fs, nperseg=nperseg)
+    band = f >= min_hz
+    if not band.any():
+        return
+    f, pxx = f[band], pxx[band]
+    f_peak = f[np.argmax(pxx)]
+    cum = np.cumsum(pxx) / np.sum(pxx)
+    f_lo, f_hi = f[np.searchsorted(cum, 0.10)], f[min(np.searchsorted(cum, 0.90), len(f) - 1)]
+    print(f"  Spectrum (>{min_hz} Hz): dominant {f_peak:.2f} Hz; 10-90% of power in {f_lo:.2f}-{f_hi:.2f} Hz")
+    if f_lo > 0 and f_hi > 0:
+        win = 1.0 / f_lo + 2 * (0.25 / f_hi)
+        tau = (0.25 / f_hi) / 2
+        print(f"  DB8-rule suggestion (min_f={f_lo:.2f}, max_f={f_hi:.2f}): "
+              f"window ~ {win:.2f} s ({win * fs:.0f} samples), delay ~ {tau:.3f} s ({tau * fs:.1f} samples)")
+
+
+def takens_points(x: np.ndarray, delay: int, dim: int, stride: int) -> np.ndarray:
+    """Takens point cloud of one window; same indexing as gtda TakensEmbedding
+    (points are aligned to the end of the window, so the last point uses the last sample)."""
+    span = len(x) - (dim - 1) * delay - 1
+    if span < 0:
+        return np.empty((0, dim))
+    n_points = span // stride + 1
+    first = span % stride
+    last = first + (n_points - 1) * stride
+    return np.column_stack([x[first + d * delay: last + d * delay + 1: stride] for d in range(dim)])
+
+
+def extract_csv_profile(t, acc, pos, window_size, delay, step, stride, progress_every):
+    vr_model = VietorisRipsPersistence(homology_dimensions=[1]) if CSV_COMPUTE_VR else None
+    rows = []
+    n_windows = max(0, (len(acc) - window_size) // step + 1)
+    t0 = time.time()
+    for k, start in enumerate(range(0, len(acc) - window_size + 1, step)):
+        stop = start + window_size
+        pc = takens_points(minmax_minus1_plus1(acc[start:stop]), delay, CSV_DIM, stride)
+        ftda, fit_ok = compute_fasttda_minor_axis(pc)
+        row = {"Time": float(t[stop - 1])}               # endpoint label, as DB8
+        if pos is not None:
+            row["CartLocation"] = float(pos[stop - 1])
+        row.update({
+            "FastTDA": ftda,
+            "FastTDA_ZeroInvalid": float(ftda) if np.isfinite(ftda) else 0.0,
+            "FastTDA_FitOK": bool(fit_ok),
+            "VR": compute_vr_max_h1(pc, vr_model) if CSV_COMPUTE_VR else np.nan,
+            "Alpha": compute_alpha_max_h1(pc) if CSV_COMPUTE_ALPHA else np.nan,
+            "Window_Number": k,
+            "Window_Size": int(window_size),
+            "Takens_Delay": int(delay),
+        })
+        rows.append(row)
+        if progress_every and (k + 1) % progress_every == 0:
+            print(f"    W{window_size}_T{delay}: {k+1}/{n_windows} windows | elapsed {time.time()-t0:.1f} s")
+    return pd.DataFrame(rows)
+
+
+def run_csv_trial(csv_path: str):
+    input_path = to_local_path(csv_path)
+    if not os.path.isfile(input_path):
+        raise FileNotFoundError(f"Could not find CSV trial:\n{input_path}")
+
+    tag = os.path.splitext(os.path.basename(input_path))[0]
+    print("\n" + "=" * 80)
+    print(f"CSV FastTDA extraction: {tag}")
+    print("=" * 80)
+
+    t, acc, pos, fs, pos_col = load_csv_trial(input_path)
+
+    step = max(1, int(CSV_STEP_SAMPLES))
+    stride = max(1, int(CSV_EMBED_STRIDE))
+    out_dir = to_local_path(CSV_OUTPUT_DIR) if CSV_OUTPUT_DIR else os.path.dirname(input_path)
+    out_path = os.path.join(out_dir, f"Code2_{tag}_FastTDA_FineTune.xlsx")
+
+    metadata_rows = []
+    profile_frames = {}
+    combos = [(w, d) for w in CSV_WINDOW_S for d in CSV_DELAY_S]
+    for i, (w_s, d_s) in enumerate(combos, 1):
+        window_size = int(round(w_s * fs))
+        delay = max(1, int(round(d_s * fs)))
+        name = f"W{window_size}_T{delay}"
+        if name in profile_frames:
+            continue
+        n_points = (window_size - delay * (CSV_DIM - 1) - 1) // stride + 1
+        if n_points < 5 or window_size > len(acc):
+            print(f"  [{i}/{len(combos)}] {name}: skipped (fewer than 5 embedded points, "
+                  f"or window longer than signal)")
+            continue
+        print(f"  [{i}/{len(combos)}] Running profile {name} "
+              f"(window {window_size / fs:.3f} s, delay {delay / fs:.3f} s, "
+              f"{n_points} points/window)")
+        t0 = time.time()
+        df_profile = extract_csv_profile(t, acc, pos, window_size, delay, step, stride, PROGRESS_EVERY_CSV)
+        profile_frames[name] = df_profile
+        metadata_rows.append({
+            "Profile": name,
+            "Dataset": tag,
+            "Sampling_Hz": fs,
+            "Lowpass_Hz": CSV_CUTOFF,
+            "Filter_Order": CSV_FILTER_ORDER,
+            "Window_Size": window_size,
+            "Signal_Column": CSV_SIGNAL_COL,
+            "Window_s": window_size / fs,
+            "Window_Step": step,
+            "Takens_Delay": delay,
+            "Delay_s": delay / fs,
+            "Takens_Dimension": CSV_DIM,
+            "Takens_Stride": stride,
+            "Points_per_Window": n_points,
+            "Time_Label": "endpoint",
+            "Rows": len(df_profile),
+            "FastTDA_Invalid_Count": int((~df_profile["FastTDA_FitOK"]).sum()),
+            **feature_summary(df_profile, "CartLocation" if pos is not None else None),
+            "Runtime_s": time.time() - t0,
+        })
+
+    os.makedirs(out_dir, exist_ok=True)
+    with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
+        pd.DataFrame(metadata_rows).to_excel(writer, sheet_name="Metadata", index=False)
+        for profile_name, df_profile in profile_frames.items():
+            df_profile.to_excel(writer, sheet_name=profile_name[:31], index=False)
+
+    print(f"  Saved: {out_path}")
+    return out_path
+
+
+# ============================================================
 # MAIN
 # ============================================================
 
@@ -725,14 +987,15 @@ def main():
           f"({len(DB6_WINDOW_SIZES) * len(DB6_DELAYS)} profiles per file)")
     print(f"DB8 grid: windows {DB8_WINDOW_SIZES} x delays {DB8_DELAYS} "
           f"({len(DB8_WINDOW_SIZES) * len(DB8_DELAYS)} profiles)")
-    print(f"Alpha enabled: {COMPUTE_ALPHA}")
+    print(f"Run: DB6={RUN_DB6}, DB8={RUN_DB8}, CSV={RUN_CSV}")
+    print(f"Alpha enabled: DB6/DB8={COMPUTE_ALPHA}, CSV={CSV_COMPUTE_ALPHA}")
     print("=" * 80)
 
-    if not os.path.isdir(WORK_DIR):
+    if (RUN_DB6 or RUN_DB8) and not os.path.isdir(WORK_DIR):
         raise FileNotFoundError(f"WORK_DIR does not exist:\n{WORK_DIR}")
 
     # Fail early (not on the first window) if Alpha is requested without GUDHI
-    if COMPUTE_ALPHA:
+    if (COMPUTE_ALPHA and (RUN_DB6 or RUN_DB8)) or (CSV_COMPUTE_ALPHA and RUN_CSV):
         try:
             import gudhi  # noqa: F401
         except ImportError as exc:
@@ -743,11 +1006,16 @@ def main():
 
     outputs = []
 
-    for tag, filename in DB6_INPUTS.items():
-        outputs.append(run_dataset6(tag, filename))
+    if RUN_DB6:
+        for tag, filename in DB6_INPUTS.items():
+            outputs.append(run_dataset6(tag, filename))
 
-    for tag, filename in DB8_INPUT.items():
-        outputs.append(run_dataset8(tag, filename))
+    if RUN_DB8:
+        for tag, filename in DB8_INPUT.items():
+            outputs.append(run_dataset8(tag, filename))
+
+    if RUN_CSV:
+        outputs.append(run_csv_trial(CSV_PATH))
 
     outputs = [p for p in outputs if p is not None]
 
@@ -758,7 +1026,7 @@ def main():
     for path in outputs:
         print("  -", path)
     if not outputs:
-        print("  (none - no input files were found in WORK_DIR)")
+        print("  (none - no input files were found)")
     print("=" * 80)
 
 
