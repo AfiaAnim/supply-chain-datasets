@@ -1,15 +1,31 @@
 """
 FastTDA fine-tuning on a single capacitance trial (e.g. trial_01.csv).
 
-For every (window length, Takens delay) combination in the grid:
+For every (window length, Takens delay) setting:
     1. slide a window over the signal,
     2. min-max scale the window to [-1, 1],
     3. build a 2-D Takens embedding,
     4. FastTDA: fit an ellipse (SVD-LSE, A + C = 1) and report its minor axis 2b
        (optionally also VR / Alpha max H1 persistence).
 
-Output: <trial>_FastTDA_FineTune.xlsx next to the CSV, with a "Summary" sheet and one
-sheet per combination (W<window samples>_T<delay samples>).
+Auto-tuning (MODE = "auto"):
+    Stage 1 - coarse grid over WINDOW_S x DELAY_S.
+    Stage 2 - refine grid around the best coarse setting.
+    Every setting is scored on how reliable its FastTDA output is (no label needed):
+        Invalid_pct  - % of windows where the ellipse fit fails       (lower is better)
+        Spike_pct    - % of values far above the typical level        (lower is better)
+        Roughness    - median step-to-step jump / interquartile range (lower = smoother)
+        Window_s     - window length (shorter = better time resolution)
+    Longer windows always look smoother and fail less (they overlap more and blur fast
+    changes), so window length is scored too; RESOLUTION_WEIGHT sets how much it counts.
+    Score = weighted mean rank over these metrics (lower is better). Rank 1 is recommended.
+    If the file has a label column (POS_COL), |correlation| with it is added to the score.
+
+MODE = "grid" runs only WINDOW_S x DELAY_S (no refine stage).
+
+Output: <trial>_FastTDA_FineTune.xlsx next to the CSV:
+    "Summary"  - every setting tried, sorted by Score, with all metrics
+    one sheet per top-ranked setting (W<window samples>_T<delay samples>)
 
 Requirements:
     pip install numpy pandas scipy scikit-learn openpyxl
@@ -36,7 +52,7 @@ OUTPUT_DIR = None            # None = save next to the CSV
 # Columns (header names). A leading unnamed row-index column is ignored.
 TIME_COL = "time_s"
 SIGNAL_COL = "capacitance_filtered_pF"
-POS_COL = None               # position/label column, or None if there is none
+POS_COL = None               # label column (e.g. position/damage), or None if there is none
 
 FS = None                    # sampling rate in Hz; None = estimate from the time column (~88 Hz)
 CUTOFF = None                # extra low-pass (Hz); None = none. Must be < FS/2 (~44 Hz).
@@ -44,15 +60,26 @@ CUTOFF = None                # extra low-pass (Hz); None = none. Must be < FS/2 
 FILTER_ORDER = 6
 DIM = 2
 
-# Fine-tuning grid in SECONDS; every window is run with every delay.
-WINDOW_S = [1.0, 1.5, 2.0]
-DELAY_S = [0.03, 0.06, 0.09]
+MODE = "auto"                # "auto" = coarse grid + refine around the best; "grid" = grid only
+
+# Coarse grid in SECONDS (every window is run with every delay)
+WINDOW_S = [1.0, 1.5, 2.0, 2.5, 3.0, 4.0]
+DELAY_S = [0.03, 0.06, 0.09, 0.12, 0.16, 0.20, 0.25]
+
+# Refine stage (MODE = "auto"): multipliers applied to the best coarse window / delay
+REFINE_WINDOW_FACTORS = [0.8, 0.9, 1.0, 1.1, 1.2]
+REFINE_DELAY_FACTORS = [0.75, 0.875, 1.0, 1.125, 1.25]
+
 STEP_SAMPLES = 1             # window step in samples
 EMBED_STRIDE = 1             # samples between embedded points
+MAX_DELAY_FRACTION = 0.25    # skip settings whose delay is longer than this fraction of the window
+RESOLUTION_WEIGHT = 1.0      # weight of "shorter window" in the score (0 = ignore time resolution)
+SPIKE_MADS = 6.0             # a spike is a value above median + SPIKE_MADS * robust std
+TOP_N_SHEETS = 9             # how many of the best settings get their own sheet
 
 COMPUTE_VR = False           # VR max H1 (needs giotto-tda; slower)
 COMPUTE_ALPHA = False        # Alpha max H1 (needs gudhi; slowest)
-PROGRESS_EVERY = 2000
+PROGRESS_EVERY = 0           # print progress every N windows (0 = off)
 
 
 # ============================================================
@@ -273,7 +300,7 @@ def load_trial(path: str):
 
 
 # ============================================================
-# EXTRACTION
+# EXTRACTION AND SCORING
 # ============================================================
 
 def extract_profile(t, x, pos, window_size, delay, step, stride, vr_model):
@@ -305,19 +332,79 @@ def extract_profile(t, x, pos, window_size, delay, step, stride, vr_model):
     return pd.DataFrame(rows)
 
 
-def summarize(df: pd.DataFrame) -> dict:
-    out = {}
-    for col in ("FastTDA", "VR", "Alpha"):
-        if col not in df:
-            continue
-        x = df[col].astype(float)
-        out[f"{col}_mean"] = float(np.nanmean(x)) if x.notna().any() else np.nan
-        out[f"{col}_std"] = float(np.nanstd(x)) if x.notna().any() else np.nan
-        if "Position" in df:
-            ok = x.notna()
-            out[f"Corr_{col}_Position"] = (float(np.corrcoef(x[ok], df.loc[ok, "Position"])[0, 1])
-                                           if ok.sum() > 2 and x[ok].std() > 0 else np.nan)
+def quality_metrics(df: pd.DataFrame) -> dict:
+    """Reliability of a FastTDA series (no label needed)."""
+    v = df["FastTDA"].to_numpy(float)
+    ok = np.isfinite(v)
+    out = {"Invalid_pct": 100.0 * (1 - ok.mean())}
+    v = v[ok]
+    if v.size < 10:
+        return {**out, "Spike_pct": np.nan, "Roughness": np.nan,
+                "FastTDA_median": np.nan, "FastTDA_mean": np.nan, "FastTDA_std": np.nan}
+    med = np.median(v)
+    mad = 1.4826 * np.median(np.abs(v - med))
+    iqr = np.subtract(*np.percentile(v, [75, 25]))
+    out["Spike_pct"] = 100.0 * np.mean(v > med + SPIKE_MADS * mad) if mad > 0 else 0.0
+    out["Roughness"] = float(np.median(np.abs(np.diff(v))) / iqr) if iqr > 0 else np.nan
+    out["FastTDA_median"] = float(med)
+    out["FastTDA_mean"] = float(np.mean(v))
+    out["FastTDA_std"] = float(np.std(v))
+    for col in ("VR", "Alpha"):
+        if col in df:
+            out[f"{col}_mean"] = float(np.nanmean(df[col]))
+    if "Position" in df:
+        p = df.loc[ok, "Position"].to_numpy(float)
+        out["Abs_Corr_Position"] = (float(abs(np.corrcoef(v, p)[0, 1]))
+                                    if np.std(p) > 0 and np.std(v) > 0 else np.nan)
     return out
+
+
+def add_scores(summary: pd.DataFrame) -> pd.DataFrame:
+    """Score = weighted mean rank of reliability + time resolution (lower is better)."""
+    s = summary.copy()
+    ranks = [s["Invalid_pct"].rank(), s["Spike_pct"].rank(), s["Roughness"].rank()]
+    weights = [1.0, 1.0, 1.0]
+    if "Abs_Corr_Position" in s:
+        ranks.append(s["Abs_Corr_Position"].rank(ascending=False))
+        weights.append(1.0)
+    if RESOLUTION_WEIGHT > 0:
+        ranks.append(s["Window_s"].rank())
+        weights.append(RESOLUTION_WEIGHT)
+    r = pd.concat(ranks, axis=1).to_numpy(float)
+    s["Score"] = (r * np.array(weights)).sum(axis=1) / sum(weights)
+    s = s.sort_values(["Score", "Invalid_pct"]).reset_index(drop=True)
+    s.insert(0, "Rank", np.arange(1, len(s) + 1))
+    return s
+
+
+def run_settings(settings, stage, t, x, pos, fs, step, stride, vr_model, done):
+    """Run (window_samples, delay_samples) settings that have not been run yet."""
+    rows = []
+    todo = [(w, d) for w, d in settings if (w, d) not in done]
+    for i, (w, d) in enumerate(todo, 1):
+        name = f"W{w}_T{d}"
+        n_points = (w - d * (DIM - 1) - 1) // stride + 1
+        if n_points < 5 or w > len(x) or d > MAX_DELAY_FRACTION * w:
+            done[(w, d)] = None
+            continue
+        t0 = time.time()
+        df = extract_profile(t, x, pos, w, d, step, stride, vr_model)
+        m = quality_metrics(df)
+        done[(w, d)] = df
+        rows.append({
+            "Profile": name, "Stage": stage,
+            "Window_Size": w, "Window_s": w / fs, "Takens_Delay": d, "Delay_s": d / fs,
+            "Points_per_Window": n_points, "Windows": len(df),
+            "FastTDA_Invalid_Count": int((~df["FastTDA_FitOK"]).sum()),
+            **m,
+            "Signal_Column": SIGNAL_COL, "Sampling_Hz": fs, "Lowpass_Hz": CUTOFF,
+            "Window_Step": step, "Takens_Stride": stride,
+            "Runtime_s": time.time() - t0,
+        })
+        print(f"  [{stage} {i}/{len(todo)}] {name:10s} window {w / fs:5.2f} s, delay {d / fs:.3f} s | "
+              f"invalid {m['Invalid_pct']:5.2f}%  spikes {m['Spike_pct']:5.2f}%  "
+              f"roughness {m['Roughness']:.3f}")
+    return rows
 
 
 def main():
@@ -326,7 +413,7 @@ def main():
         raise FileNotFoundError(f"Could not find the trial CSV:\n{input_path}")
     tag = os.path.splitext(os.path.basename(input_path))[0]
     print("=" * 80)
-    print(f"FastTDA fine-tuning: {input_path}")
+    print(f"FastTDA fine-tuning ({MODE}): {input_path}")
     print("=" * 80)
 
     t, x, pos, fs = load_trial(input_path)
@@ -340,58 +427,57 @@ def main():
 
     step = max(1, int(STEP_SAMPLES))
     stride = max(1, int(EMBED_STRIDE))
-    combos = [(w, d) for w in WINDOW_S for d in DELAY_S]
+    done = {}
 
-    sheets, summary = {}, []
-    for i, (w_s, d_s) in enumerate(combos, 1):
-        window_size = int(round(w_s * fs))
-        delay = max(1, int(round(d_s * fs)))
-        name = f"W{window_size}_T{delay}"
-        if name in sheets:
-            continue
-        n_points = (window_size - delay * (DIM - 1) - 1) // stride + 1
-        if n_points < 5 or window_size > len(x):
-            print(f"  [{i}/{len(combos)}] {name}: skipped (fewer than 5 embedded points, "
-                  f"or window longer than signal)")
-            continue
+    # ---- Stage 1: coarse grid
+    coarse = sorted({(int(round(w * fs)), max(1, int(round(d * fs))))
+                     for w in WINDOW_S for d in DELAY_S})
+    print(f"\nStage 1: coarse grid, {len(coarse)} settings")
+    rows = run_settings(coarse, "coarse", t, x, pos, fs, step, stride, vr_model, done)
+    if not rows:
+        raise RuntimeError("No valid settings in the coarse grid; check WINDOW_S / DELAY_S.")
 
-        print(f"  [{i}/{len(combos)}] {name}: window {window_size / fs:.3f} s, "
-              f"delay {delay / fs:.3f} s, {n_points} points/window")
-        t0 = time.time()
-        df = extract_profile(t, x, pos, window_size, delay, step, stride, vr_model)
-        sheets[name] = df
-        summary.append({
-            "Profile": name,
-            "Signal_Column": SIGNAL_COL,
-            "Sampling_Hz": fs,
-            "Lowpass_Hz": CUTOFF,
-            "Window_Size": window_size,
-            "Window_s": window_size / fs,
-            "Takens_Delay": delay,
-            "Delay_s": delay / fs,
-            "Window_Step": step,
-            "Takens_Stride": stride,
-            "Points_per_Window": n_points,
-            "Windows": len(df),
-            "FastTDA_Invalid_Count": int((~df["FastTDA_FitOK"]).sum()),
-            **summarize(df),
-            "Runtime_s": time.time() - t0,
-        })
+    # ---- Stage 2: refine around the best coarse setting
+    if MODE == "auto":
+        best = add_scores(pd.DataFrame(rows)).iloc[0]
+        bw, bd = int(best["Window_Size"]), int(best["Takens_Delay"])
+        print(f"\nBest coarse setting: W{bw}_T{bd} (window {bw / fs:.2f} s, delay {bd / fs:.3f} s)")
+        on_edge = []
+        if best["Window_s"] >= max(WINDOW_S) * 0.999 or best["Window_s"] <= min(WINDOW_S) * 1.001:
+            on_edge.append("window")
+        if best["Delay_s"] >= max(DELAY_S) * 0.97 or best["Delay_s"] <= min(DELAY_S) * 1.03:
+            on_edge.append("delay")
+        if on_edge:
+            print(f"  Note: best {' and '.join(on_edge)} is at the edge of the coarse grid; "
+                  f"consider extending WINDOW_S / DELAY_S in that direction.")
+        refine = sorted({(max(3, int(round(bw * fw))), max(1, int(round(bd * fd))))
+                         for fw in REFINE_WINDOW_FACTORS for fd in REFINE_DELAY_FACTORS})
+        print(f"Stage 2: refine grid around it, {len(refine)} settings")
+        rows += run_settings(refine, "refine", t, x, pos, fs, step, stride, vr_model, done)
+
+    summary = add_scores(pd.DataFrame(rows))
 
     out_dir = to_local_path(OUTPUT_DIR) if OUTPUT_DIR else os.path.dirname(input_path)
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, f"{tag}_FastTDA_FineTune.xlsx")
-    summary_df = pd.DataFrame(summary)
+    top = summary.head(TOP_N_SHEETS)
     with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
-        summary_df.to_excel(writer, sheet_name="Summary", index=False)
-        for name, df in sheets.items():
-            df.to_excel(writer, sheet_name=name[:31], index=False)
+        summary.to_excel(writer, sheet_name="Summary", index=False)
+        for _, r in top.iterrows():
+            done[(int(r["Window_Size"]), int(r["Takens_Delay"]))].to_excel(
+                writer, sheet_name=r["Profile"][:31], index=False)
 
-    print("\n" + summary_df[["Profile", "Window_s", "Delay_s", "Points_per_Window",
-                             "FastTDA_mean", "FastTDA_std", "FastTDA_Invalid_Count"]]
-          .round(4).to_string(index=False))
-    print(f"\nSaved: {out_path}")
-    return summary_df, sheets
+    cols = ["Rank", "Profile", "Stage", "Window_s", "Delay_s", "Invalid_pct", "Spike_pct",
+            "Roughness", "FastTDA_median", "Score"]
+    if "Abs_Corr_Position" in summary:
+        cols.insert(-1, "Abs_Corr_Position")
+    print("\nTop settings (lower Score = more reliable FastTDA output):")
+    print(summary[cols].head(10).round(4).to_string(index=False))
+    b = summary.iloc[0]
+    print(f"\nRecommended: {b['Profile']}  ->  window {b['Window_s']:.2f} s ({int(b['Window_Size'])} samples), "
+          f"delay {b['Delay_s']:.3f} s ({int(b['Takens_Delay'])} samples)")
+    print(f"Saved: {out_path}  (Summary of all {len(summary)} settings + sheets for the top {len(top)})")
+    return summary
 
 
 if __name__ == "__main__":

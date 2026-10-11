@@ -3,8 +3,8 @@ Visualize the FastTDA fine-tuning results produced by trial_fasttda_finetune.py.
 
 Figures:
     1. Signal (raw + filtered capacitance) and FastTDA (2b) over time for one profile
-    2. FastTDA over time for every window/delay combination (one panel per window length)
-    3. Grid overview heatmaps: invalid-fit rate and mean FastTDA for each window x delay
+    2. FastTDA over time for the top-ranked settings (small multiples, shared y-axis)
+    3. Grid overview heatmaps (coarse grid): invalid-fit rate and tuning score
     4. Example windows: Takens point cloud with the fitted FastTDA ellipse
 
 Run it after trial_fasttda_finetune.py. Figures are shown and saved as PNGs next to the
@@ -34,7 +34,7 @@ TIME_COL = "time_s"
 SIGNAL_COL = "capacitance_filtered_pF"   # the column the analysis used
 RAW_COL = "capacitance_raw_pF"           # shown for reference in figure 1 (None to hide)
 
-PROFILE = None               # e.g. "W133_T5"; None = profile with the fewest invalid fits
+PROFILE = None               # e.g. "W133_T5"; None = the recommended setting (Rank 1)
 EXAMPLE_TIMES = None         # e.g. [10, 30, 50] (seconds, window end); None = 3 spread-out windows
 SAVE_FIGS = True             # save PNGs next to the results file
 
@@ -172,33 +172,35 @@ def fig_signal_and_fasttda(df_csv, prof_df, prof_name, out_dir):
 
 
 def fig_all_profiles(sheets, summary, out_dir):
-    windows = sorted(summary["Window_Size"].unique())
-    delays = sorted(summary["Takens_Delay"].unique())
-    color_of = {d: SERIES[i % len(SERIES)] for i, d in enumerate(delays)}   # fixed per delay
-    fig, axes = plt.subplots(len(windows), 1, figsize=(11, 2.6 * len(windows)),
+    rows = summary[summary["Profile"].isin(sheets.keys())]
+    n = len(rows)
+    ncols = 3 if n > 4 else 1
+    nrows = int(np.ceil(n / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5.2 * ncols if ncols > 1 else 11, 2.4 * nrows),
                              sharex=True, sharey=True, squeeze=False)
     # Robust shared y-range: rare fit spikes would otherwise flatten every line
-    allv = np.concatenate([sheets[p]["FastTDA"].to_numpy(float) for p in summary["Profile"]])
+    allv = np.concatenate([sheets[p]["FastTDA"].to_numpy(float) for p in rows["Profile"]])
     allv = allv[np.isfinite(allv)]
     ymax = np.percentile(allv, 99.5) * 1.1
     n_clipped = int((allv > ymax).sum())
-    for ax, w in zip(axes[:, 0], windows):
-        rows = summary[summary["Window_Size"] == w]
-        for _, r in rows.sort_values("Takens_Delay").iterrows():
-            d = r["Takens_Delay"]
-            df = sheets[r["Profile"]]
-            ax.plot(df["Time"], df["FastTDA"], color=color_of[d], lw=1.2,
-                    label=f"delay {r['Delay_s']:.3f} s ({d} samples)")
-        ax.set_title(f"Window {rows['Window_s'].iloc[0]:.2f} s ({w} samples)", loc="left")
-        ax.set_ylabel("FastTDA 2b")
+    for ax, (_, r) in zip(axes.ravel(), rows.iterrows()):
+        df = sheets[r["Profile"]]
+        best = "Rank" in r and r["Rank"] == rows["Rank"].min() if "Rank" in rows else False
+        ax.plot(df["Time"], df["FastTDA"], color=SERIES[0] if best else NEUTRAL, lw=1.1)
+        rank = f"#{int(r['Rank'])}  " if "Rank" in r else ""
+        ax.set_title(f"{rank}window {r['Window_s']:.2f} s, delay {r['Delay_s']:.3f} s",
+                     loc="left", fontsize=9, color=TEXT if best else TEXT_2)
+    for ax in axes.ravel()[n:]:
+        ax.set_visible(False)
     axes[0, 0].set_ylim(0, ymax)
-    axes[-1, 0].set_xlabel("Time (s), window end")
-    note = f" ({n_clipped} spikes above {ymax:.2f} not shown)" if n_clipped else ""
-    fig.suptitle(f"FastTDA for every window x delay combination{note}", color=TEXT,
-                 fontweight="bold", y=0.995)
-    handles, labels = axes[0, 0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="upper center", ncol=len(delays), bbox_to_anchor=(0.5, 0.965))
-    save(fig, out_dir, "fig2_all_profiles.png", top=0.94)
+    for ax in axes[:, 0]:
+        ax.set_ylabel("FastTDA 2b")
+    for ax in axes[-1, :]:
+        ax.set_xlabel("Time (s), window end")
+    note = f"  ({n_clipped} spikes above {ymax:.2f} not shown)" if n_clipped else ""
+    fig.suptitle(f"FastTDA for the top-ranked settings, best in blue{note}", color=TEXT,
+                 fontweight="bold")
+    save(fig, out_dir, "fig2_all_profiles.png")
 
 
 def _heatmap(ax, matrix, row_labels, col_labels, title, fmt):
@@ -223,17 +225,21 @@ def _heatmap(ax, matrix, row_labels, col_labels, title, fmt):
 
 def fig_grid_overview(summary, out_dir):
     s = summary.copy()
+    if "Stage" in s:
+        s = s[s["Stage"] == "coarse"]
     s["Invalid_pct"] = 100 * s["FastTDA_Invalid_Count"] / s["Windows"]
     windows = sorted(s["Window_Size"].unique())
     delays = sorted(s["Takens_Delay"].unique())
     wl = [f"{s.loc[s.Window_Size == w, 'Window_s'].iloc[0]:.2f} s" for w in windows]
     dl = [f"{s.loc[s.Takens_Delay == d, 'Delay_s'].iloc[0]:.3f} s" for d in delays]
     inv = s.pivot(index="Window_Size", columns="Takens_Delay", values="Invalid_pct").loc[windows, delays]
-    mean = s.pivot(index="Window_Size", columns="Takens_Delay", values="FastTDA_mean").loc[windows, delays]
+    second, title2, fmt2 = (("Score", "Tuning score (lower = better)", "{:.1f}") if "Score" in s
+                            else ("FastTDA_mean", "Mean FastTDA 2b", "{:.3f}"))
+    other = s.pivot(index="Window_Size", columns="Takens_Delay", values=second).loc[windows, delays]
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4))
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 0.45 * len(windows) + 2.6))
     _heatmap(ax1, inv.to_numpy(), wl, dl, "Invalid ellipse fits (% of windows)", "{:.1f}%")
-    _heatmap(ax2, mean.to_numpy(), wl, dl, "Mean FastTDA 2b", "{:.3f}")
+    _heatmap(ax2, other.to_numpy(), wl, dl, title2, fmt2)
     save(fig, out_dir, "fig3_grid_overview.png")
 
 
@@ -297,6 +303,8 @@ def main():
 
     if PROFILE:
         prof_name = PROFILE
+    elif "Rank" in summary:
+        prof_name = summary.sort_values("Rank").iloc[0]["Profile"]
     else:
         s = summary.assign(rate=summary["FastTDA_Invalid_Count"] / summary["Windows"])
         prof_name = s.sort_values(["rate", "Window_Size"]).iloc[0]["Profile"]
