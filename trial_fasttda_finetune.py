@@ -461,11 +461,22 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, f"{tag}_FastTDA_FineTune.xlsx")
     top = summary.head(TOP_N_SHEETS)
-    with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
-        summary.to_excel(writer, sheet_name="Summary", index=False)
-        for _, r in top.iterrows():
-            done[(int(r["Window_Size"]), int(r["Takens_Delay"]))].to_excel(
-                writer, sheet_name=r["Profile"][:31], index=False)
+
+    def write_excel(path):
+        with pd.ExcelWriter(path, engine="openpyxl") as writer:
+            summary.to_excel(writer, sheet_name="Summary", index=False)
+            for _, r in top.iterrows():
+                done[(int(r["Window_Size"]), int(r["Takens_Delay"]))].to_excel(
+                    writer, sheet_name=r["Profile"][:31], index=False)
+
+    try:
+        write_excel(out_path)
+    except PermissionError:
+        # Usually the file is open in Excel (Windows locks it) - save under a new name instead
+        locked = out_path
+        out_path = os.path.join(out_dir, f"{tag}_FastTDA_FineTune_{time.strftime('%Y%m%d_%H%M%S')}.xlsx")
+        print(f"\nCould not overwrite {locked} (is it open in Excel?). Saving to a new file instead.")
+        write_excel(out_path)
 
     cols = ["Rank", "Profile", "Stage", "Window_s", "Delay_s", "Invalid_pct", "Spike_pct",
             "Roughness", "FastTDA_median", "Score"]
