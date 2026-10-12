@@ -19,6 +19,10 @@ Auto-tuning (MODE = "auto"):
     Longer windows always look smoother and fail less (they overlap more and blur fast
     changes), so window length is scored too; RESOLUTION_WEIGHT sets how much it counts.
     Score = weighted mean rank over these metrics (lower is better). Rank 1 is recommended.
+    With TUNE_FROM_FIRST_FIT_OK, each setting is scored only from the first window where
+    FastTDA_FitOK turns True and stays True for FIT_OK_RUN_S seconds (Tune_From_s), so the
+    start-up transient does not count against it. Skipped_Start_s (start-up time skipped) is
+    reported in the Summary. The saved sheets still hold every window.
     If the file has a label column (POS_COL), |correlation| with it is added to the score.
 
 MODE = "grid" runs only WINDOW_S x DELAY_S (no refine stage).
@@ -91,6 +95,8 @@ EMBED_STRIDE = 1             # samples between embedded points
 MAX_DELAY_FRACTION = 0.25    # skip settings whose delay is longer than this fraction of the window
 RESOLUTION_WEIGHT = 1.0      # weight of "shorter window" in the score (0 = ignore time resolution)
 SPIKE_MADS = 6.0             # a spike is a value above median + SPIKE_MADS * robust std
+TUNE_FROM_FIRST_FIT_OK = True  # score each setting only from where FastTDA_FitOK first turns True
+FIT_OK_RUN_S = 1.0           # ... and stays True for this long without a failure (skips start-up)
 TOP_N_SHEETS = 9             # how many of the best settings get their own sheet
 
 COMPUTE_VR = False           # VR max H1 (needs giotto-tda; slower)
@@ -409,11 +415,19 @@ def clean_report(df: pd.DataFrame) -> dict:
             "Clean_NaN": int(df["FastTDA_clean"].isna().sum())}
 
 
+def first_fit_ok_index(fit_ok: np.ndarray, run: int) -> int:
+    """Index of the first window that starts `run` consecutive FastTDA_FitOK = True windows."""
+    fit_ok = np.asarray(fit_ok, bool)
+    run = max(1, min(int(run), len(fit_ok)))
+    full = np.flatnonzero(np.convolve(fit_ok.astype(int), np.ones(run, int), mode="valid") == run)
+    return int(full[0]) if full.size else len(fit_ok)
+
+
 def quality_metrics(df: pd.DataFrame) -> dict:
     """Reliability of a FastTDA series (no label needed)."""
     v = df["FastTDA"].to_numpy(float)
     ok = np.isfinite(v)
-    out = {"Invalid_pct": 100.0 * (1 - ok.mean())}
+    out = {"Invalid_pct": 100.0 * (1 - ok.mean()) if v.size else 100.0}
     v = v[ok]
     if v.size < 10:
         return {**out, "Spike_pct": np.nan, "Roughness": np.nan,
@@ -466,7 +480,11 @@ def run_settings(settings, stage, t, x, pos, fs, step, stride, vr_model, done):
             continue
         t0 = time.time()
         df = extract_profile(t, x, pos, w, d, step, stride, vr_model)
-        m = quality_metrics(df)
+        i0 = first_fit_ok_index(df["FastTDA_FitOK"], round(FIT_OK_RUN_S * fs / step)) if TUNE_FROM_FIRST_FIT_OK else 0
+        m = quality_metrics(df.iloc[i0:])
+        m["Tune_From_s"] = float(df["Time"].iloc[i0]) if i0 < len(df) else np.nan
+        m["Skipped_Start_s"] = m["Tune_From_s"] - float(df["Time"].iloc[0])  # start-up time skipped
+        m["Skipped_Start_Windows"] = i0
         df = clean_fasttda(df, fs, step)
         c = clean_report(df)
         done[(w, d)] = df
@@ -481,6 +499,7 @@ def run_settings(settings, stage, t, x, pos, fs, step, stride, vr_model, done):
             "Runtime_s": time.time() - t0,
         })
         print(f"  [{stage} {i}/{len(todo)}] {name:10s} window {w / fs:5.2f} s, delay {d / fs:.3f} s | "
+              f"from {m['Tune_From_s']:5.2f} s | "
               f"invalid {m['Invalid_pct']:5.2f}%  spikes {m['Spike_pct']:5.2f}%  "
               f"roughness {m['Roughness']:.3f}")
         if stage == "final":
@@ -570,7 +589,7 @@ def main():
         print(f"\nCould not overwrite {locked} (is it open in Excel?). Saving to a new file instead.")
         write_excel(out_path)
 
-    cols = ["Rank", "Profile", "Stage", "Window_s", "Delay_s", "Invalid_pct", "Spike_pct",
+    cols = ["Rank", "Profile", "Stage", "Window_s", "Delay_s", "Tune_From_s", "Skipped_Start_s", "Invalid_pct", "Spike_pct",
             "Roughness", "FastTDA_median", "Score"]
     if "Abs_Corr_Position" in summary:
         cols.insert(-1, "Abs_Corr_Position")
