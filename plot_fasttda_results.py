@@ -28,13 +28,14 @@ from sklearn.preprocessing import MinMaxScaler
 # ============================================================
 
 CSV_PATH = r"C:\Users\aphya\Downloads\trial_01.csv"
-RESULTS_XLSX = None          # None = <trial>_FastTDA_FineTune.xlsx next to the CSV
+RESULTS_XLSX = None          # None = <trial>_FastTDA_final.xlsx (chosen setting) next to the CSV,
+                             # or <trial>_FastTDA_FineTune.xlsx if there is no final file
 
 TIME_COL = "time_s"
 SIGNAL_COL = "capacitance_filtered_pF"   # the column the analysis used
 RAW_COL = "capacitance_raw_pF"           # shown for reference in figure 1 (None to hide)
 
-PROFILE = None               # e.g. "W133_T5"; None = the recommended setting (Rank 1)
+PROFILE = "W159_T8"          # chosen setting (window 1.80 s, delay 0.091 s); None = Rank 1
 EXAMPLE_TIMES = None         # e.g. [10, 30, 50] (seconds, window end); None = 3 spread-out windows
 SAVE_FIGS = True             # save PNGs next to the results file
 
@@ -289,8 +290,13 @@ def fig_embedding_examples(df_csv, prof_df, window_size, delay, stride, prof_nam
 def main():
     csv_path = to_local_path(CSV_PATH)
     tag = os.path.splitext(os.path.basename(csv_path))[0]
-    xlsx = to_local_path(RESULTS_XLSX) if RESULTS_XLSX else os.path.join(
-        os.path.dirname(csv_path), f"{tag}_FastTDA_FineTune.xlsx")
+    if RESULTS_XLSX:
+        xlsx = to_local_path(RESULTS_XLSX)
+    else:
+        final = os.path.join(os.path.dirname(csv_path), f"{tag}_FastTDA_final.xlsx")
+        tuned = os.path.join(os.path.dirname(csv_path), f"{tag}_FastTDA_FineTune.xlsx")
+        xlsx = final if os.path.isfile(final) else tuned
+    print(f"Results: {xlsx}")
     for p in (csv_path, xlsx):
         if not os.path.isfile(p):
             raise FileNotFoundError(f"Not found: {p}\nRun trial_fasttda_finetune.py first.")
@@ -315,8 +321,9 @@ def main():
           f"(window {meta['Window_s']:.2f} s, delay {meta['Delay_s']:.3f} s)")
 
     fig_signal_and_fasttda(df_csv, sheets[prof_name], prof_name, out_dir)
-    fig_all_profiles(sheets, summary, out_dir)
-    fig_grid_overview(summary, out_dir)
+    if len(sheets) > 1:                      # comparison figures need more than one setting
+        fig_all_profiles(sheets, summary, out_dir)
+        fig_grid_overview(summary, out_dir)
     fig_embedding_examples(df_csv, sheets[prof_name], int(meta["Window_Size"]),
                            int(meta["Takens_Delay"]), int(meta["Takens_Stride"]), prof_name, out_dir)
 

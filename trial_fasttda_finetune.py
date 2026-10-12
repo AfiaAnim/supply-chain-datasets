@@ -22,6 +22,8 @@ Auto-tuning (MODE = "auto"):
     If the file has a label column (POS_COL), |correlation| with it is added to the score.
 
 MODE = "grid" runs only WINDOW_S x DELAY_S (no refine stage).
+MODE = "fixed" runs only FIXED_WINDOW_SAMPLES / FIXED_DELAY_SAMPLES (the chosen setting) and
+saves it to <trial>_FastTDA_final.xlsx, leaving the tuning results untouched.
 
 Output: <trial>_FastTDA_FineTune.xlsx next to the CSV:
     "Summary"  - every setting tried, sorted by Score, with all metrics
@@ -60,7 +62,12 @@ CUTOFF = None                # extra low-pass (Hz); None = none. Must be < FS/2 
 FILTER_ORDER = 6
 DIM = 2
 
-MODE = "auto"                # "auto" = coarse grid + refine around the best; "grid" = grid only
+MODE = "fixed"               # "fixed" = run the chosen setting only;
+                             # "auto" = coarse grid + refine around the best; "grid" = grid only
+
+# Chosen setting (from the auto-tuning run: Rank 1 = W159_T8, window 1.80 s, delay 0.091 s)
+FIXED_WINDOW_SAMPLES = 159
+FIXED_DELAY_SAMPLES = 8
 
 # Coarse grid in SECONDS (every window is run with every delay)
 WINDOW_S = [1.0, 1.5, 2.0, 2.5, 3.0, 4.0]
@@ -429,13 +436,21 @@ def main():
     stride = max(1, int(EMBED_STRIDE))
     done = {}
 
-    # ---- Stage 1: coarse grid
-    coarse = sorted({(int(round(w * fs)), max(1, int(round(d * fs))))
-                     for w in WINDOW_S for d in DELAY_S})
-    print(f"\nStage 1: coarse grid, {len(coarse)} settings")
-    rows = run_settings(coarse, "coarse", t, x, pos, fs, step, stride, vr_model, done)
-    if not rows:
-        raise RuntimeError("No valid settings in the coarse grid; check WINDOW_S / DELAY_S.")
+    if MODE == "fixed":
+        w, d = int(FIXED_WINDOW_SAMPLES), int(FIXED_DELAY_SAMPLES)
+        print(f"\nFixed setting: W{w}_T{d} (window {w / fs:.2f} s, delay {d / fs:.3f} s)")
+        rows = run_settings([(w, d)], "final", t, x, pos, fs, step, stride, vr_model, done)
+        if not rows:
+            raise RuntimeError(f"W{w}_T{d} is not a valid setting for this signal "
+                               f"(too few embedded points or delay > {MAX_DELAY_FRACTION} x window).")
+    else:
+        # ---- Stage 1: coarse grid
+        coarse = sorted({(int(round(w * fs)), max(1, int(round(d * fs))))
+                         for w in WINDOW_S for d in DELAY_S})
+        print(f"\nStage 1: coarse grid, {len(coarse)} settings")
+        rows = run_settings(coarse, "coarse", t, x, pos, fs, step, stride, vr_model, done)
+        if not rows:
+            raise RuntimeError("No valid settings in the coarse grid; check WINDOW_S / DELAY_S.")
 
     # ---- Stage 2: refine around the best coarse setting
     if MODE == "auto":
@@ -459,7 +474,8 @@ def main():
 
     out_dir = to_local_path(OUTPUT_DIR) if OUTPUT_DIR else os.path.dirname(input_path)
     os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, f"{tag}_FastTDA_FineTune.xlsx")
+    suffix = "final" if MODE == "fixed" else "FineTune"
+    out_path = os.path.join(out_dir, f"{tag}_FastTDA_{suffix}.xlsx")
     top = summary.head(TOP_N_SHEETS)
 
     def write_excel(path):
@@ -474,7 +490,7 @@ def main():
     except PermissionError:
         # Usually the file is open in Excel (Windows locks it) - save under a new name instead
         locked = out_path
-        out_path = os.path.join(out_dir, f"{tag}_FastTDA_FineTune_{time.strftime('%Y%m%d_%H%M%S')}.xlsx")
+        out_path = os.path.join(out_dir, f"{tag}_FastTDA_{suffix}_{time.strftime('%Y%m%d_%H%M%S')}.xlsx")
         print(f"\nCould not overwrite {locked} (is it open in Excel?). Saving to a new file instead.")
         write_excel(out_path)
 
