@@ -2,7 +2,7 @@
 All-in-one TDA pipeline for a capacitance trial (e.g. trial_01.csv). Paste into ONE Jupyter cell.
 
     1. Load the CSV (time + capacitance), optional low-pass filter.
-    2. Fine-tune window length and Takens delay with FastTDA (MODE = "auto"):
+    2. Fine-tune window length, Takens delay and per-window detrending with FastTDA (MODE = "auto"):
          coarse grid over WINDOW_S x DELAY_S, then a refine grid around the best setting.
          Each setting is scored only from where FastTDA_FitOK first turns True and stays True
          for FIT_OK_RUN_S seconds (skips the start-up), on:
@@ -61,12 +61,15 @@ FILTER_ORDER = 5
 MODE = "auto"                           # "auto" = fine-tune first; "fixed" = use FIXED_* below
 FIXED_WINDOW = 159                      # samples (used when MODE = "fixed")
 FIXED_DELAY = 8                         # samples
+FIXED_DETREND = False                   # remove each window's linear trend (used when MODE = "fixed")
 
 # Fine-tuning grid (seconds) and refine multipliers
 WINDOW_S = [1.0, 1.5, 2.0, 2.5, 3.0, 4.0]
 DELAY_S = [0.03, 0.06, 0.09, 0.12, 0.16, 0.20, 0.25]
 REFINE_WINDOW_FACTORS = [0.8, 0.9, 1.0, 1.1, 1.2]
 REFINE_DELAY_FACTORS = [0.75, 0.875, 1.0, 1.125, 1.25]
+DETREND_OPTIONS = [False, True]         # fine-tuning also tries removing each window's linear trend
+                                        # (the slow capacitance drift can stop the ellipse fit)
 MAX_DELAY_FRACTION = 0.25               # skip settings whose delay > this fraction of the window
 RESOLUTION_WEIGHT = 1.0                 # weight of "shorter window" in the score (0 = ignore)
 TUNE_FROM_FIRST_FIT_OK = True           # score only from where FastTDA_FitOK first turns True
@@ -117,11 +120,20 @@ def takens_points(x, delay, dim, stride):
     return np.column_stack([x[first + d * delay: last + d * delay + 1: stride] for d in range(dim)])
 
 
-def point_clouds(x, window, delay):
+def point_clouds(x, window, delay, detrend=False):
     starts = np.arange(0, len(x) - window + 1, WINDOW_STEP)
-    clouds = np.stack([takens_points(minmax_minus1_plus1(x[s:s + window]), delay, TAKENS_DIM, TAKENS_STRIDE)
-                       for s in starts])
-    return starts, clouds
+    idx = np.arange(window)
+    clouds = []
+    for s in starts:
+        seg = x[s:s + window]
+        if detrend:                               # remove the window's straight-line drift
+            seg = seg - np.polyval(np.polyfit(idx, seg, 1), idx)
+        clouds.append(takens_points(minmax_minus1_plus1(seg), delay, TAKENS_DIM, TAKENS_STRIDE))
+    return starts, np.stack(clouds)
+
+
+def profile_name(window, delay, detrend):
+    return f"W{window}_T{delay}" + ("_DT" if detrend else "")
 
 
 # ============================================================
@@ -194,16 +206,16 @@ def first_fit_ok_index(fit_ok, run):
     return int(full[0]) if full.size else len(fit_ok)
 
 
-def score_setting(x, t, fs, window, delay):
-    starts, clouds = point_clouds(x, window, delay)
+def score_setting(x, t, fs, window, delay, detrend):
+    starts, clouds = point_clouds(x, window, delay, detrend)
     res = [fasttda_minor_axis(pc) for pc in clouds]
     v = np.array([r[0] for r in res], dtype=float)
     ok = np.array([r[1] for r in res], dtype=bool)
     t_end = t[starts + window - 1]
     i0 = first_fit_ok_index(ok, round(FIT_OK_RUN_S * fs / WINDOW_STEP)) if TUNE_FROM_FIRST_FIT_OK else 0
     v, ok = v[i0:], ok[i0:]
-    out = {"Profile": f"W{window}_T{delay}", "Window_Size": window, "Window_s": window / fs,
-           "Takens_Delay": delay, "Delay_s": delay / fs, "Windows": len(starts),
+    out = {"Profile": profile_name(window, delay, detrend), "Window_Size": window, "Window_s": window / fs,
+           "Takens_Delay": delay, "Delay_s": delay / fs, "Detrend": bool(detrend), "Windows": len(starts),
            "Tune_From_s": float(t_end[i0]) if i0 < len(t_end) else np.nan,
            "Skipped_Start_s": float(t_end[min(i0, len(t_end) - 1)] - t_end[0]),
            "Invalid_pct": 100.0 * (1 - ok.mean()) if ok.size else 100.0}
@@ -235,15 +247,15 @@ def add_scores(summary):
 
 def run_grid(settings, stage, x, t, fs, done):
     rows = []
-    todo = [(w, d) for w, d in settings
-            if (w, d) not in done and d <= MAX_DELAY_FRACTION * w and w <= len(x)
+    todo = [(w, d, dt) for w, d, dt in settings
+            if (w, d, dt) not in done and d <= MAX_DELAY_FRACTION * w and w <= len(x)
             and (w - d * (TAKENS_DIM - 1) - 1) // TAKENS_STRIDE + 1 >= 5]
-    for i, (w, d) in enumerate(todo, 1):
-        r = score_setting(x, t, fs, w, d)
+    for i, (w, d, dt) in enumerate(todo, 1):
+        r = score_setting(x, t, fs, w, d, dt)
         r["Stage"] = stage
-        done.add((w, d))
+        done.add((w, d, dt))
         rows.append(r)
-        print(f"  [{stage} {i}/{len(todo)}] W{w}_T{d}: window {w / fs:5.2f} s, delay {d / fs:.3f} s | "
+        print(f"  [{stage} {i}/{len(todo)}] {r['Profile']}: window {w / fs:5.2f} s, delay {d / fs:.3f} s | "
               f"from {r['Tune_From_s']:5.2f} s | invalid {r['Invalid_pct']:5.2f}%  "
               f"spikes {r['Spike_pct']:5.2f}%  roughness {r['Roughness']:.3f}")
     return rows
@@ -251,15 +263,16 @@ def run_grid(settings, stage, x, t, fs, done):
 
 def fine_tune(x, t, fs):
     done = set()
-    coarse = sorted({(int(round(w * fs)), max(1, int(round(d * fs)))) for w in WINDOW_S for d in DELAY_S})
+    coarse = sorted({(int(round(w * fs)), max(1, int(round(d * fs))), bool(dt))
+                     for w in WINDOW_S for d in DELAY_S for dt in DETREND_OPTIONS})
     print(f"\nFine-tuning stage 1: coarse grid, {len(coarse)} settings")
     rows = run_grid(coarse, "coarse", x, t, fs, done)
     best = add_scores(pd.DataFrame(rows)).iloc[0]
-    bw, bd = int(best["Window_Size"]), int(best["Takens_Delay"])
-    refine = sorted({(max(3, int(round(bw * fw))), max(1, int(round(bd * fd))))
+    bw, bd, bdt = int(best["Window_Size"]), int(best["Takens_Delay"]), bool(best["Detrend"])
+    refine = sorted({(max(3, int(round(bw * fw))), max(1, int(round(bd * fd))), bdt)
                      for fw in REFINE_WINDOW_FACTORS for fd in REFINE_DELAY_FACTORS})
     n_new = len([r for r in refine if r not in done])
-    print(f"\nFine-tuning stage 2: refine around W{bw}_T{bd}, {n_new} new settings")
+    print(f"\nFine-tuning stage 2: refine around {best['Profile']}, {n_new} new settings")
     rows += run_grid(refine, "refine", x, t, fs, done)
     return add_scores(pd.DataFrame(rows))
 
@@ -268,8 +281,8 @@ def fine_tune(x, t, fs):
 # 2) PROFILE (VR, Alpha, FastTDA) + 3) CLEANING
 # ============================================================
 
-def extract_profile(t, x, label, window, delay):
-    starts, clouds = point_clouds(x, window, delay)
+def extract_profile(t, x, label, window, delay, detrend):
+    starts, clouds = point_clouds(x, window, delay, detrend)
     lab_idx = starts + (window // 2 if TIME_LABEL == "midpoint" else window - 1)
     t0 = time.time()
     ftda = [fasttda_minor_axis(pc) for pc in clouds]
@@ -347,8 +360,9 @@ def plot_tuning(summary, dataset, out_dir):
     s = summary[summary["Stage"] == "coarse"]
     if s.empty:
         return
-    piv = s.pivot_table(index="Window_s", columns="Delay_s", values="Score")
-    inv = s.pivot_table(index="Window_s", columns="Delay_s", values="Invalid_pct")
+    # with several detrend options, each cell shows the better of them
+    piv = s.pivot_table(index="Window_s", columns="Delay_s", values="Score", aggfunc="min")
+    inv = s.pivot_table(index="Window_s", columns="Delay_s", values="Invalid_pct", aggfunc="min")
     cmap = LinearSegmentedColormap.from_list("blue", ["#cde2fb", "#6da7ec", "#256abf", "#0d366b"])
     fig, axes = plt.subplots(1, 2, figsize=(12, 0.45 * len(piv) + 2.6))
     for ax, m, title, fmt in ((axes[0], inv, "Invalid FastTDA fits (%)", "{:.1f}"),
@@ -440,18 +454,20 @@ if MODE == "auto":
     t0 = time.time()
     summary = fine_tune(x, t, fs)
     print(f"\nFine-tuning done in {time.time() - t0:.0f} s. Top 10 settings:")
-    print(summary[["Rank", "Profile", "Stage", "Window_s", "Delay_s", "Tune_From_s", "Invalid_pct",
+    print(summary[["Rank", "Profile", "Stage", "Window_s", "Delay_s", "Detrend", "Tune_From_s", "Invalid_pct",
                    "Spike_pct", "Roughness", "FastTDA_median", "Score"]].head(10).round(4).to_string(index=False))
     window, delay = int(summary.iloc[0]["Window_Size"]), int(summary.iloc[0]["Takens_Delay"])
+    detrend = bool(summary.iloc[0]["Detrend"])
     note = NOTE or f"auto-tuned (Rank 1 of {len(summary)} settings)"
 else:
-    window, delay = int(FIXED_WINDOW), int(FIXED_DELAY)
+    window, delay, detrend = int(FIXED_WINDOW), int(FIXED_DELAY), bool(FIXED_DETREND)
     note = NOTE or "fixed setting"
-print(f"\nUsing W{window}_T{delay}: window {window / fs:.2f} s, delay {delay / fs:.3f} s")
+print(f"\nUsing {profile_name(window, delay, detrend)}: window {window / fs:.2f} s, delay {delay / fs:.3f} s, "
+      f"detrend {'on' if detrend else 'off'}")
 
 # ---- 2) profile with VR, Alpha, FastTDA
 name = f"W{window}"
-df, t_end = extract_profile(t, x, label, window, delay)
+df, t_end = extract_profile(t, x, label, window, delay, detrend)
 n_bad = int((~df["FastTDA_FitOK"]).sum())
 print(f"    {len(df)} windows, {n_bad} invalid FastTDA fits")
 meta = {
@@ -459,7 +475,7 @@ meta = {
     "Filter_Order": FILTER_ORDER if LOWPASS_HZ else None, "Window_Size": window,
     "Window_Step": WINDOW_STEP, "Takens_Delay": delay, "Takens_Dimension": TAKENS_DIM,
     "Takens_Stride": TAKENS_STRIDE, "Time_Label": TIME_LABEL, "Rows": len(df),
-    "FastTDA_Invalid_Count": n_bad, "Note": note,
+    "FastTDA_Invalid_Count": n_bad, "Note": note, "Detrend": detrend,
 }
 
 # ---- 3) clean + smooth VR, Alpha, FastTDA
