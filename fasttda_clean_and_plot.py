@@ -5,7 +5,7 @@ Paste the whole file into ONE Jupyter cell and run it (or: python fasttda_clean_
 It does not depend on any other script or on the earlier Excel files.
 
 Output (next to the CSV):
-    trial_01_FastTDA_clean.xlsx   - Time, FastTDA (raw), FastTDA_clean, Clean_Mask, ...
+    trial_01_FastTDA_clean.xlsx   - Time, FastTDA (raw), FastTDA_clean, Clean_Mask, FastTDA_smooth
     trial_01_FastTDA_clean.png    - signal + raw/clean FastTDA
 """
 
@@ -36,10 +36,11 @@ RAW_COL = "capacitance_raw_pF"          # shown in the top plot (None to hide)
 WINDOW = 159                            # samples (1.80 s at 88.4 Hz)
 DELAY = 8                               # samples (0.091 s)
 
-TRIM_START_S = 2.7                      # drop windows ending before this time (start-up)
+TRIM_START_S = 4.5                      # drop windows ending before this time (start-up)
 EDGE_GUARD_WINDOWS = 5                  # also mask this many windows each side of a failed fit
 SPIKE_MADS = 6.0                        # mask values above median + this many robust std
 MAX_INTERP_GAP_S = 1.0                  # interpolate masked runs up to this long
+SMOOTH_S = 0.25                         # rolling-median length for FastTDA_smooth (0 = off)
 
 
 # ============================================================
@@ -127,10 +128,15 @@ for a, b in zip(edges[::2], edges[1::2]):
 clean[reason == "startup"] = np.nan
 df["FastTDA_clean"] = clean
 df["Clean_Mask"] = reason
+# Rolling median removes the short 1-5 window jumps caused by per-window min-max rescaling
+n_smooth = max(1, int(round(SMOOTH_S * fs)) | 1)
+df["FastTDA_smooth"] = (df["FastTDA_clean"].rolling(n_smooth, center=True, min_periods=n_smooth // 2 + 1)
+                        .median() if SMOOTH_S else df["FastTDA_clean"])
 
 print("Clean_Mask counts:", pd.Series(reason).value_counts().to_dict())
 print(f"FastTDA raw   max {np.nanmax(v):.3f}, mean {np.nanmean(v):.3f}")
 print(f"FastTDA clean max {np.nanmax(clean):.3f}, mean {np.nanmean(clean):.3f}")
+print(f"FastTDA smooth max {np.nanmax(df['FastTDA_smooth']):.3f}, mean {np.nanmean(df['FastTDA_smooth']):.3f}")
 
 # ---- save
 stem = os.path.splitext(csv_path)[0]
@@ -152,7 +158,9 @@ ax1.set_title("Capacitance signal")
 ax1.legend(loc="upper right", ncol=2, frameon=False)
 
 ax2.plot(df["Time"], v, color="#a3a29c", lw=0.8, label="FastTDA raw")
-ax2.plot(df["Time"], clean, color="#2a78d6", lw=1.5, label="FastTDA clean")
+ax2.plot(df["Time"], clean, color="#9ec5f4", lw=1.0, label="FastTDA clean")
+ax2.plot(df["Time"], df["FastTDA_smooth"], color="#2a78d6", lw=1.6,
+         label=f"FastTDA smooth ({SMOOTH_S} s median)")
 lo, hi = np.nanmin(clean), np.nanmax(clean)
 ax2.set_ylim(lo - 0.15 * (hi - lo), hi + 0.1 * (hi - lo))
 bad = df[~ok]
@@ -161,7 +169,7 @@ ax2.plot(bad["Time"], np.full(len(bad), lo - 0.1 * (hi - lo)), "|", color="#eb68
 ax2.axvspan(df["Time"].iloc[0], TRIM_START_S, color="#e4e3df", lw=0, label="start-up (dropped)")
 ax2.set_ylabel("FastTDA minor axis 2b")
 ax2.set_xlabel("Time (s), window end")
-ax2.set_title(f"FastTDA W{WINDOW}_T{DELAY}: raw (grey) vs clean (blue)")
+ax2.set_title(f"FastTDA W{WINDOW}_T{DELAY}: raw (grey), clean (light blue), smooth (blue)")
 ax2.legend(loc="upper right", ncol=2, frameon=False)
 for ax in (ax1, ax2):
     ax.grid(color="#e4e3df", lw=0.6)
