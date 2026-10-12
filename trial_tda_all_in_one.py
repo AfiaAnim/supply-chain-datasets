@@ -258,7 +258,8 @@ def fine_tune(x, t, fs):
     bw, bd = int(best["Window_Size"]), int(best["Takens_Delay"])
     refine = sorted({(max(3, int(round(bw * fw))), max(1, int(round(bd * fd))))
                      for fw in REFINE_WINDOW_FACTORS for fd in REFINE_DELAY_FACTORS})
-    print(f"\nFine-tuning stage 2: refine around W{bw}_T{bd}, {len(refine)} settings")
+    n_new = len([r for r in refine if r not in done])
+    print(f"\nFine-tuning stage 2: refine around W{bw}_T{bd}, {n_new} new settings")
     rows += run_grid(refine, "refine", x, t, fs, done)
     return add_scores(pd.DataFrame(rows))
 
