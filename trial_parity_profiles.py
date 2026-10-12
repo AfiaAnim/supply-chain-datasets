@@ -8,7 +8,9 @@ Code2_<dataset>_ParityProfiles.xlsx:
     "Metadata" sheet: Profile, Dataset, Sampling_Hz, Lowpass_Hz, Filter_Order, Window_Size,
         Window_Step, Takens_Delay, Takens_Dimension, Takens_Stride, Time_Label, Rows,
         FastTDA_Invalid_Count, Note
-    "Cleaned" sheet(s): FastTDA_clean / FastTDA_smooth for each profile (extra, optional)
+    "<profile>_Cleaned" sheet(s): for VR, Alpha and FastTDA the raw value, <f>_clean
+        (start-up trimmed, invalid windows + neighbours and spikes masked, short gaps
+        interpolated), <f>_smooth (rolling median of _clean) and <f>_Mask (why masked)
 
 Per window: min-max scale to [-1, 1] -> 2-D Takens embedding -> VR max H1 (giotto-tda),
 Alpha max H1 (GUDHI, 2*sqrt(alpha) convention), FastTDA ellipse minor axis 2b.
@@ -65,6 +67,7 @@ EDGE_GUARD_WINDOWS = 5
 SPIKE_MADS = 6.0
 MAX_INTERP_GAP_S = 1.0
 SMOOTH_S = 0.25
+CLEAN_FEATURES = ["VR", "Alpha", "FastTDA"]
 
 
 # ============================================================
@@ -173,18 +176,23 @@ def extract_profile(t, x, label, window, delay):
     }), t[starts + window - 1]
 
 
-def clean_fasttda(df, t_end, fs):
-    ok = df["FastTDA_FitOK"].to_numpy(bool)
-    v = df["FastTDA"].to_numpy(float)
+def clean_feature(df, col, t_end, fs):
+    """Clean one feature column: mask start-up, invalid windows (+ neighbours) and high spikes,
+    interpolate short masked runs, then a rolling median. Returns (clean, mask, smooth)."""
+    v = df[col].to_numpy(float)
+    ok = np.isfinite(v)
+    if col == "FastTDA":
+        ok &= df["FastTDA_FitOK"].to_numpy(bool)
     reason = np.full(len(df), "ok", dtype=object)
-    reason[~ok] = "fit_failed"
+    reason[~ok] = "invalid"
     near = np.convolve((~ok).astype(int), np.ones(2 * EDGE_GUARD_WINDOWS + 1, int), mode="same") > 0
     reason[near & ok] = "gap_edge"
+    reason[t_end < TRIM_START_S] = "startup"
     keep = reason == "ok"
     med = np.median(v[keep])
     mad = 1.4826 * np.median(np.abs(v[keep] - med))
-    reason[keep & (v > med + SPIKE_MADS * mad)] = "spike"
-    reason[t_end < TRIM_START_S] = "startup"
+    if mad > 0:
+        reason[keep & (v > med + SPIKE_MADS * mad)] = "spike"
     good = reason == "ok"
     clean = np.where(good, v, np.nan)
     tt = df["Time"].to_numpy(float)
@@ -197,8 +205,21 @@ def clean_fasttda(df, t_end, fs):
     clean[reason == "startup"] = np.nan
     n = max(1, int(round(SMOOTH_S * fs / WINDOW_STEP)) | 1)
     smooth = pd.Series(clean).rolling(n, center=True, min_periods=n // 2 + 1).median().to_numpy()
-    return pd.DataFrame({"Time": tt, "FastTDA": v, "FastTDA_clean": clean, "Clean_Mask": reason,
-                         "FastTDA_smooth": smooth})
+    return clean, reason, smooth
+
+
+def clean_profile(df, t_end, fs):
+    """Cleaned sheet: <feature>, <feature>_clean, <feature>_smooth, <feature>_Mask for VR, Alpha, FastTDA."""
+    out = {"Time": df["Time"].to_numpy(float)}
+    for col in CLEAN_FEATURES:
+        if not np.isfinite(df[col]).any():
+            continue                                    # feature not computed
+        clean, mask, smooth = clean_feature(df, col, t_end, fs)
+        out.update({col: df[col].to_numpy(float), f"{col}_clean": clean,
+                    f"{col}_smooth": smooth, f"{col}_Mask": mask})
+        counts = pd.Series(mask).value_counts().to_dict()
+        print(f"    {col:8s} cleaned: " + ", ".join(f"{k} {v}" for k, v in counts.items()))
+    return pd.DataFrame(out)
 
 
 # ============================================================
@@ -231,7 +252,7 @@ for (w, d), name in zip(PROFILES, names):
     print(f"    {len(df)} windows, {n_bad} invalid FastTDA fits")
     sheets[name] = df
     if ADD_CLEANED_SHEET:
-        cleaned[name] = clean_fasttda(df, t_end, fs)
+        cleaned[name] = clean_profile(df, t_end, fs)
     meta.append({
         "Profile": name, "Dataset": dataset, "Sampling_Hz": round(fs, 4), "Lowpass_Hz": LOWPASS_HZ,
         "Filter_Order": FILTER_ORDER if LOWPASS_HZ else None, "Window_Size": w,
@@ -268,6 +289,16 @@ for name, df in sheets.items():
     print(df.describe().T[["mean", "std", "min", "max"]].round(4).to_string())
 print("\nMetadata:")
 print(pd.DataFrame(meta).T.to_string(header=False))
+for name, cdf in cleaned.items():
+    rows = []
+    for col in CLEAN_FEATURES:
+        if f"{col}_smooth" in cdf:
+            for kind in ("", "_clean", "_smooth"):
+                v = cdf[f"{col}{kind}"]
+                rows.append({"Column": f"{col}{kind}", "mean": v.mean(), "std": v.std(),
+                             "min": v.min(), "max": v.max(), "empty": int(v.isna().sum())})
+    print(f"\n{name}_Cleaned - raw vs clean vs smooth:")
+    print(pd.DataFrame(rows).round(4).to_string(index=False))
 
 # ---- plot: the feature columns of each profile over time
 for name, df in sheets.items():
@@ -277,11 +308,11 @@ for name, df in sheets.items():
     for ax, col, colr in zip(axes, cols, colors):
         y = df[col].to_numpy(float)
         ax.plot(df["Time"], y, color=colr, lw=1.0)
+        if name in cleaned and f"{col}_smooth" in cleaned[name]:
+            ax.plot(df["Time"], cleaned[name][f"{col}_smooth"], color="#0d366b", lw=1.4,
+                    label=f"{col}_smooth (Cleaned sheet)")
+            ax.legend(loc="upper right", frameon=False, fontsize=8)
         if col == "FastTDA":
-            if name in cleaned:
-                ax.plot(df["Time"], cleaned[name]["FastTDA_smooth"], color="#0d366b", lw=1.4,
-                        label="FastTDA_smooth (Cleaned sheet)")
-                ax.legend(loc="upper right", frameon=False, fontsize=8)
             fin = y[np.isfinite(y)]
             if fin.size:
                 ax.set_ylim(np.nanmin(fin) * 0.9, np.percentile(fin, 99.5) * 1.1)
