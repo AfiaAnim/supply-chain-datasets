@@ -14,7 +14,11 @@ All-in-one TDA pipeline for a capacitance trial (e.g. trial_01.csv). Paste into 
        spikes masked, short gaps interpolated, rolling median).
     5. Save one workbook and show the figures.
 
-Output (next to the CSV):
+Several trials: list them in CSV_PATHS. TUNE_MODE = "common" tunes one setting on all trials
+together (metrics averaged; same window/delay/detrend for every trial, so they are comparable),
+"per_trial" tunes each trial on its own. An All_Trials_TDA_Summary.xlsx compares the trials.
+
+Output (next to each CSV):
     <trial>_TDA_Results.xlsx
         Tuning_Summary   every setting tried, ranked (only in MODE = "auto")
         W<window>        Time, <label>, VR, Alpha, FastTDA, FastTDA_ZeroInvalid,
@@ -50,7 +54,15 @@ except Exception:
 # SETTINGS
 # ============================================================
 
-CSV_PATH = r"C:\Users\aphya\Downloads\trial_01.csv"
+# One or more trials. All trials are processed; each gets its own workbook and figures.
+CSV_PATHS = [
+    r"C:\Users\aphya\Downloads\trial_01.csv",
+    r"C:\Users\aphya\Downloads\trial_02.csv",
+    r"C:\Users\aphya\Downloads\trial_03.csv",
+]
+TUNE_MODE = "common"                    # "common" = one setting tuned on all trials together
+                                        #            (same window/delay -> trials are comparable)
+                                        # "per_trial" = tune each trial separately
 TIME_COL = "time_s"
 SIGNAL_COL = "capacitance_filtered_pF"  # signal used for the TDA features
 LABEL_COL = "capacitance_filtered_pF"   # 2nd column of the profile sheet
@@ -245,36 +257,52 @@ def add_scores(summary):
     return s
 
 
-def run_grid(settings, stage, x, t, fs, done):
-    rows = []
+def run_grid(settings, stage, trials, done):
+    """Score each setting on every trial; the tuning metrics are averaged over the trials."""
+    rows, detail = [], []
     todo = [(w, d, dt) for w, d, dt in settings
-            if (w, d, dt) not in done and d <= MAX_DELAY_FRACTION * w and w <= len(x)
+            if (w, d, dt) not in done and d <= MAX_DELAY_FRACTION * w
+            and all(w <= len(tr["x"]) for tr in trials)
             and (w - d * (TAKENS_DIM - 1) - 1) // TAKENS_STRIDE + 1 >= 5]
+    fs = np.mean([tr["fs"] for tr in trials])
     for i, (w, d, dt) in enumerate(todo, 1):
-        r = score_setting(x, t, fs, w, d, dt)
-        r["Stage"] = stage
+        per = []
+        for tr in trials:
+            r = score_setting(tr["x"], tr["t"], tr["fs"], w, d, dt)
+            r.update({"Trial": tr["name"], "Stage": stage})
+            per.append(r)
+        detail += per
+        p = pd.DataFrame(per)
+        r = {k: per[0][k] for k in ("Profile", "Window_Size", "Takens_Delay", "Detrend")}
+        r.update({"Window_s": w / fs, "Delay_s": d / fs, "Stage": stage, "Trials": len(per),
+                  "Tune_From_s": p["Tune_From_s"].mean(), "Invalid_pct": p["Invalid_pct"].mean(),
+                  "Worst_Invalid_pct": p["Invalid_pct"].max(), "Spike_pct": p["Spike_pct"].mean(),
+                  "Roughness": p["Roughness"].mean(), "FastTDA_median": p["FastTDA_median"].mean()})
         done.add((w, d, dt))
         rows.append(r)
         print(f"  [{stage} {i}/{len(todo)}] {r['Profile']}: window {w / fs:5.2f} s, delay {d / fs:.3f} s | "
-              f"from {r['Tune_From_s']:5.2f} s | invalid {r['Invalid_pct']:5.2f}%  "
+              f"invalid {r['Invalid_pct']:5.2f}% (worst {r['Worst_Invalid_pct']:5.2f}%)  "
               f"spikes {r['Spike_pct']:5.2f}%  roughness {r['Roughness']:.3f}")
-    return rows
+    return rows, detail
 
 
-def fine_tune(x, t, fs):
+def fine_tune(trials):
+    """Coarse grid + refine around the best; returns (ranked summary, per-trial details)."""
+    fs = np.mean([tr["fs"] for tr in trials])
+    names = ", ".join(tr["name"] for tr in trials)
     done = set()
     coarse = sorted({(int(round(w * fs)), max(1, int(round(d * fs))), bool(dt))
                      for w in WINDOW_S for d in DELAY_S for dt in DETREND_OPTIONS})
-    print(f"\nFine-tuning stage 1: coarse grid, {len(coarse)} settings")
-    rows = run_grid(coarse, "coarse", x, t, fs, done)
+    print(f"\nFine-tuning on {names}\nStage 1: coarse grid, {len(coarse)} settings")
+    rows, detail = run_grid(coarse, "coarse", trials, done)
     best = add_scores(pd.DataFrame(rows)).iloc[0]
     bw, bd, bdt = int(best["Window_Size"]), int(best["Takens_Delay"]), bool(best["Detrend"])
     refine = sorted({(max(3, int(round(bw * fw))), max(1, int(round(bd * fd))), bdt)
                      for fw in REFINE_WINDOW_FACTORS for fd in REFINE_DELAY_FACTORS})
     n_new = len([r for r in refine if r not in done])
-    print(f"\nFine-tuning stage 2: refine around {best['Profile']}, {n_new} new settings")
-    rows += run_grid(refine, "refine", x, t, fs, done)
-    return add_scores(pd.DataFrame(rows))
+    print(f"\nStage 2: refine around {best['Profile']}, {n_new} new settings")
+    r2, d2 = run_grid(refine, "refine", trials, done)
+    return add_scores(pd.DataFrame(rows + r2)), pd.DataFrame(detail + d2)
 
 
 # ============================================================
@@ -384,7 +412,7 @@ def plot_tuning(summary, dataset, out_dir):
         plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     fig.suptitle(f"{dataset}: coarse fine-tuning grid", fontweight="bold")
     fig.tight_layout()
-    png = os.path.join(out_dir, f"{dataset}_tuning.png")
+    png = os.path.join(out_dir, f"{dataset.replace(' ', '_')}_tuning.png")
     fig.savefig(png, dpi=150)
     print(f"Saved: {png}")
     plt.show()
@@ -425,99 +453,127 @@ def plot_profile(df, cdf, meta, dataset, out_dir):
 # RUN
 # ============================================================
 
-csv_path = to_local_path(CSV_PATH)
-if not os.path.isfile(csv_path):
-    raise FileNotFoundError(f"CSV not found: {csv_path}")
-dataset = os.path.splitext(os.path.basename(csv_path))[0]
-out_dir = os.path.dirname(csv_path)
-print(f"Loading {csv_path}")
-data = pd.read_csv(csv_path, sep=None, engine="python")
-data.columns = [str(c).strip() for c in data.columns]
-data = data.loc[:, [c for c in data.columns if not c.startswith("Unnamed")]]
-data = data.apply(pd.to_numeric, errors="coerce").dropna().reset_index(drop=True)
-for c in (TIME_COL, SIGNAL_COL, LABEL_COL):
-    if c not in data:
-        raise KeyError(f"Column {c!r} not found. Columns: {list(data.columns)}")
-t = data[TIME_COL].to_numpy(float)
-x = data[SIGNAL_COL].to_numpy(float)
-label = data[LABEL_COL].to_numpy(float)
-fs = (len(t) - 1) / (t[-1] - t[0])
-print(f"{len(x)} samples, {fs:.2f} Hz, {t[-1] - t[0]:.1f} s")
-if LOWPASS_HZ:
-    if LOWPASS_HZ >= fs / 2:
-        raise ValueError(f"LOWPASS_HZ must be below {fs / 2:.1f} Hz")
-    x = signal.sosfiltfilt(signal.butter(FILTER_ORDER, LOWPASS_HZ, btype="lowpass", fs=fs, output="sos"), x)
+def load_trial(path):
+    csv_path = to_local_path(path)
+    if not os.path.isfile(csv_path):
+        raise FileNotFoundError(f"CSV not found: {csv_path}")
+    data = pd.read_csv(csv_path, sep=None, engine="python")
+    data.columns = [str(c).strip() for c in data.columns]
+    data = data.loc[:, [c for c in data.columns if not c.startswith("Unnamed")]]
+    data = data.apply(pd.to_numeric, errors="coerce").dropna().reset_index(drop=True)
+    for c in (TIME_COL, SIGNAL_COL, LABEL_COL):
+        if c not in data:
+            raise KeyError(f"{csv_path}: column {c!r} not found. Columns: {list(data.columns)}")
+    t = data[TIME_COL].to_numpy(float)
+    x = data[SIGNAL_COL].to_numpy(float)
+    fs = (len(t) - 1) / (t[-1] - t[0])
+    if LOWPASS_HZ:
+        if LOWPASS_HZ >= fs / 2:
+            raise ValueError(f"LOWPASS_HZ must be below {fs / 2:.1f} Hz")
+        x = signal.sosfiltfilt(signal.butter(FILTER_ORDER, LOWPASS_HZ, btype="lowpass", fs=fs, output="sos"), x)
+    name = os.path.splitext(os.path.basename(csv_path))[0]
+    print(f"Loaded {name}: {len(x)} samples, {fs:.2f} Hz, {t[-1] - t[0]:.1f} s")
+    return {"name": name, "path": csv_path, "out_dir": os.path.dirname(csv_path),
+            "t": t, "x": x, "label": data[LABEL_COL].to_numpy(float), "fs": fs}
 
-# ---- 1) fine-tune
-summary = None
-if MODE == "auto":
-    t0 = time.time()
-    summary = fine_tune(x, t, fs)
-    print(f"\nFine-tuning done in {time.time() - t0:.0f} s. Top 10 settings:")
-    print(summary[["Rank", "Profile", "Stage", "Window_s", "Delay_s", "Detrend", "Tune_From_s", "Invalid_pct",
-                   "Spike_pct", "Roughness", "FastTDA_median", "Score"]].head(10).round(4).to_string(index=False))
-    window, delay = int(summary.iloc[0]["Window_Size"]), int(summary.iloc[0]["Takens_Delay"])
-    detrend = bool(summary.iloc[0]["Detrend"])
-    note = NOTE or f"auto-tuned (Rank 1 of {len(summary)} settings)"
+
+def save_workbook(path, sheets):
+    def write(p):
+        with pd.ExcelWriter(p, engine="openpyxl") as wr:
+            for sheet, frame in sheets.items():
+                if frame is not None:
+                    frame.to_excel(wr, sheet_name=sheet[:31], index=False)
+    try:
+        write(path)
+    except PermissionError:
+        path = path.replace(".xlsx", f"_{time.strftime('%H%M%S')}.xlsx")
+        print("Workbook is open in Excel; saving under a new name.")
+        write(path)
+    print(f"Saved: {path}")
+    return path
+
+
+def print_top(summary):
+    cols = ["Rank", "Profile", "Stage", "Window_s", "Delay_s", "Detrend", "Tune_From_s", "Invalid_pct",
+            "Worst_Invalid_pct", "Spike_pct", "Roughness", "FastTDA_median", "Score"]
+    print(summary[[c for c in cols if c in summary]].head(10).round(4).to_string(index=False))
+
+
+def process_trial(tr, window, delay, detrend, summary, detail, note):
+    """Extract VR / Alpha / FastTDA with the chosen setting, clean, save and plot one trial."""
+    fs = tr["fs"]
+    print(f"\n=== {tr['name']}: {profile_name(window, delay, detrend)} "
+          f"(window {window / fs:.2f} s, delay {delay / fs:.3f} s, detrend {'on' if detrend else 'off'})")
+    name = f"W{window}"
+    df, t_end = extract_profile(tr["t"], tr["x"], tr["label"], window, delay, detrend)
+    n_bad = int((~df["FastTDA_FitOK"]).sum())
+    print(f"    {len(df)} windows, {n_bad} invalid FastTDA fits")
+    meta = {
+        "Profile": name, "Dataset": tr["name"], "Sampling_Hz": round(fs, 4), "Lowpass_Hz": LOWPASS_HZ,
+        "Filter_Order": FILTER_ORDER if LOWPASS_HZ else None, "Window_Size": window,
+        "Window_Step": WINDOW_STEP, "Takens_Delay": delay, "Takens_Dimension": TAKENS_DIM,
+        "Takens_Stride": TAKENS_STRIDE, "Time_Label": TIME_LABEL, "Rows": len(df),
+        "FastTDA_Invalid_Count": n_bad, "Note": note, "Detrend": detrend,
+    }
+    cdf = clean_profile(df, t_end, fs)
+    trial_detail = None
+    if detail is not None and len(detail):
+        trial_detail = detail[detail["Trial"] == tr["name"]]
+    save_workbook(os.path.join(tr["out_dir"], f"{tr['name']}_TDA_Results.xlsx"), {
+        "Tuning_Summary": summary, "Tuning_This_Trial": trial_detail,
+        name: df, "Metadata": pd.DataFrame([meta]), f"{name}_Cleaned": cdf})
+
+    stats = {"Trial": tr["name"], "Profile": profile_name(window, delay, detrend), "Windows": len(df),
+             "FastTDA_Invalid_Count": n_bad, "Invalid_pct": round(100 * n_bad / len(df), 3)}
+    rows = []
+    for col in CLEAN_FEATURES:
+        if f"{col}_smooth" in cdf:
+            for kind in ("", "_clean", "_smooth"):
+                v = cdf[f"{col}{kind}"]
+                rows.append({"Column": f"{col}{kind}", "mean": v.mean(), "std": v.std(),
+                             "min": v.min(), "max": v.max(), "empty": int(v.isna().sum())})
+            stats[f"{col}_smooth_mean"] = cdf[f"{col}_smooth"].mean()
+            stats[f"{col}_smooth_std"] = cdf[f"{col}_smooth"].std()
+    print("    Raw vs clean vs smooth:")
+    print(pd.DataFrame(rows).round(4).to_string(index=False))
+    if TUNE_MODE == "per_trial" and summary is not None:
+        plot_tuning(summary, tr["name"], tr["out_dir"])
+    plot_profile(df, cdf, meta, tr["name"], tr["out_dir"])
+    return stats
+
+
+trials = [load_trial(p) for p in CSV_PATHS]
+results = []
+common_summary = None
+t_start = time.time()
+
+if MODE == "fixed":
+    for tr in trials:
+        results.append(process_trial(tr, int(FIXED_WINDOW), int(FIXED_DELAY), bool(FIXED_DETREND),
+                                     None, None, NOTE or "fixed setting"))
+elif TUNE_MODE == "common":
+    common_summary, detail = fine_tune(trials)
+    print("\nTop 10 settings (metrics averaged over all trials):")
+    print_top(common_summary)
+    best = common_summary.iloc[0]
+    w, d, dt = int(best["Window_Size"]), int(best["Takens_Delay"]), bool(best["Detrend"])
+    note = NOTE or f"common setting tuned on {len(trials)} trials (Rank 1 of {len(common_summary)})"
+    plot_tuning(common_summary, "All trials", trials[0]["out_dir"])
+    for tr in trials:
+        results.append(process_trial(tr, w, d, dt, common_summary, detail, note))
 else:
-    window, delay, detrend = int(FIXED_WINDOW), int(FIXED_DELAY), bool(FIXED_DETREND)
-    note = NOTE or "fixed setting"
-print(f"\nUsing {profile_name(window, delay, detrend)}: window {window / fs:.2f} s, delay {delay / fs:.3f} s, "
-      f"detrend {'on' if detrend else 'off'}")
+    for tr in trials:
+        summary, detail = fine_tune([tr])
+        print(f"\nTop 10 settings for {tr['name']}:")
+        print_top(summary)
+        best = summary.iloc[0]
+        results.append(process_trial(tr, int(best["Window_Size"]), int(best["Takens_Delay"]),
+                                     bool(best["Detrend"]), summary, detail,
+                                     NOTE or f"tuned on this trial (Rank 1 of {len(summary)})"))
 
-# ---- 2) profile with VR, Alpha, FastTDA
-name = f"W{window}"
-df, t_end = extract_profile(t, x, label, window, delay, detrend)
-n_bad = int((~df["FastTDA_FitOK"]).sum())
-print(f"    {len(df)} windows, {n_bad} invalid FastTDA fits")
-meta = {
-    "Profile": name, "Dataset": dataset, "Sampling_Hz": round(fs, 4), "Lowpass_Hz": LOWPASS_HZ,
-    "Filter_Order": FILTER_ORDER if LOWPASS_HZ else None, "Window_Size": window,
-    "Window_Step": WINDOW_STEP, "Takens_Delay": delay, "Takens_Dimension": TAKENS_DIM,
-    "Takens_Stride": TAKENS_STRIDE, "Time_Label": TIME_LABEL, "Rows": len(df),
-    "FastTDA_Invalid_Count": n_bad, "Note": note, "Detrend": detrend,
-}
-
-# ---- 3) clean + smooth VR, Alpha, FastTDA
-print("\nCleaning:")
-cdf = clean_profile(df, t_end, fs)
-
-# ---- 4) save
-xlsx = os.path.join(out_dir, f"{dataset}_TDA_Results.xlsx")
-
-
-def write(path):
-    with pd.ExcelWriter(path, engine="openpyxl") as wr:
-        if summary is not None:
-            summary.to_excel(wr, sheet_name="Tuning_Summary", index=False)
-        df.to_excel(wr, sheet_name=name, index=False)
-        pd.DataFrame([meta]).to_excel(wr, sheet_name="Metadata", index=False)
-        cdf.to_excel(wr, sheet_name=f"{name}_Cleaned", index=False)
-
-
-try:
-    write(xlsx)
-except PermissionError:
-    xlsx = os.path.join(out_dir, f"{dataset}_TDA_Results_{time.strftime('%H%M%S')}.xlsx")
-    print("Workbook is open in Excel; saving under a new name.")
-    write(xlsx)
-print(f"\nSaved: {xlsx}")
-
-print(f"\n{name} - first rows:")
-print(df.head().to_string(index=False))
-print("\nMetadata:")
-print(pd.Series(meta).to_string())
-rows = []
-for col in CLEAN_FEATURES:
-    if f"{col}_smooth" in cdf:
-        for kind in ("", "_clean", "_smooth"):
-            v = cdf[f"{col}{kind}"]
-            rows.append({"Column": f"{col}{kind}", "mean": v.mean(), "std": v.std(),
-                         "min": v.min(), "max": v.max(), "empty": int(v.isna().sum())})
-print("\nRaw vs clean vs smooth:")
-print(pd.DataFrame(rows).round(4).to_string(index=False))
-
-# ---- 5) figures
-if summary is not None:
-    plot_tuning(summary, dataset, out_dir)
-plot_profile(df, cdf, meta, dataset, out_dir)
+overview = pd.DataFrame(results)
+print(f"\n=== All trials ({time.time() - t_start:.0f} s) ===")
+print(overview.round(4).to_string(index=False))
+if len(trials) > 1:
+    save_workbook(os.path.join(trials[0]["out_dir"], "All_Trials_TDA_Summary.xlsx"),
+                  {"Trials": overview, "Tuning_Summary": common_summary})
