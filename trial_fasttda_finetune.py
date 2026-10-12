@@ -25,6 +25,15 @@ MODE = "grid" runs only WINDOW_S x DELAY_S (no refine stage).
 MODE = "fixed" runs only FIXED_WINDOW_SAMPLES / FIXED_DELAY_SAMPLES (the chosen setting) and
 saves it to <trial>_FastTDA_final.xlsx, leaving the tuning results untouched.
 
+Cleaning (every profile sheet gets FastTDA_clean + Clean_Mask; FastTDA stays raw):
+    startup    - windows ending before TRIM_START_S (start-up transient)    -> NaN
+    ok         - kept as is
+    fit_failed - ellipse fit failed
+    gap_edge   - within EDGE_GUARD_WINDOWS of a failed fit (unstable, gives edge spikes)
+    spike      - above median + CLEAN_SPIKE_MADS robust std
+    Masked runs up to MAX_INTERP_GAP_S long are filled by linear interpolation in time.
+    Use FastTDA_clean for analysis instead of FastTDA_ZeroInvalid (zeros are not real values).
+
 Output: <trial>_FastTDA_FineTune.xlsx next to the CSV:
     "Summary"  - every setting tried, sorted by Score, with all metrics
     one sheet per top-ranked setting (W<window samples>_T<delay samples>)
@@ -87,6 +96,12 @@ TOP_N_SHEETS = 9             # how many of the best settings get their own sheet
 COMPUTE_VR = False           # VR max H1 (needs giotto-tda; slower)
 COMPUTE_ALPHA = False        # Alpha max H1 (needs gudhi; slowest)
 PROGRESS_EVERY = 0           # print progress every N windows (0 = off)
+
+# Cleaning -> adds FastTDA_clean + Clean_Mask columns (the raw FastTDA column is kept as is)
+TRIM_START_S = 2.7           # windows ending before this time are start-up transient -> dropped (NaN)
+EDGE_GUARD_WINDOWS = 5       # also mask this many windows on each side of every failed fit
+CLEAN_SPIKE_MADS = 6.0       # mask values above median + this many robust std (None = off)
+MAX_INTERP_GAP_S = 1.0       # fill masked runs up to this long by linear interpolation; longer stay NaN
 
 
 # ============================================================
@@ -339,6 +354,61 @@ def extract_profile(t, x, pos, window_size, delay, step, stride, vr_model):
     return pd.DataFrame(rows)
 
 
+def clean_fasttda(df: pd.DataFrame, fs: float, step: int) -> pd.DataFrame:
+    """Add FastTDA_clean (masked + interpolated) and Clean_Mask (why each value was masked)."""
+    df = df.copy()
+    t = df["Time"].to_numpy(float)
+    v = df["FastTDA"].to_numpy(float)
+    ok = df["FastTDA_FitOK"].to_numpy(bool) & np.isfinite(v)
+    reason = np.full(len(df), "ok", dtype=object)
+
+    # 1) failed ellipse fits
+    reason[~ok] = "fit_failed"
+
+    # 2) windows next to a failed fit (the fit is unstable there -> edge spikes)
+    if EDGE_GUARD_WINDOWS > 0 and (~ok).any():
+        near = np.convolve((~ok).astype(int), np.ones(2 * EDGE_GUARD_WINDOWS + 1, int), mode="same") > 0
+        reason[near & ok] = "gap_edge"
+
+    # 3) remaining high spikes
+    if CLEAN_SPIKE_MADS:
+        keep = reason == "ok"
+        if keep.sum() >= 10:
+            med = np.median(v[keep])
+            mad = 1.4826 * np.median(np.abs(v[keep] - med))
+            if mad > 0:
+                reason[keep & (v > med + CLEAN_SPIKE_MADS * mad)] = "spike"
+
+    # 4) start-up transient
+    if TRIM_START_S:
+        reason[t < TRIM_START_S] = "startup"
+
+    good = reason == "ok"
+    clean = np.where(good, v, np.nan)
+    # Fill short masked runs by linear interpolation in time; long gaps and the ends stay NaN
+    max_gap = int(round(MAX_INTERP_GAP_S * fs / step)) if MAX_INTERP_GAP_S else 0
+    if max_gap > 0 and good.sum() >= 2:
+        filled = np.interp(t, t[good], v[good])
+        edges = np.flatnonzero(np.diff(np.r_[0, (~good).astype(int), 0]))
+        for a, b in zip(edges[::2], edges[1::2]):          # masked run = rows a .. b-1
+            if a > 0 and b < len(df) and b - a <= max_gap:
+                clean[a:b] = filled[a:b]
+    clean[reason == "startup"] = np.nan
+
+    i = df.columns.get_loc("FastTDA_FitOK") + 1          # place right after FastTDA_FitOK
+    df.insert(i, "FastTDA_clean", clean)
+    df.insert(i + 1, "Clean_Mask", reason)
+    return df
+
+
+def clean_report(df: pd.DataFrame) -> dict:
+    r = df["Clean_Mask"]
+    return {"Clean_Startup": int((r == "startup").sum()), "Clean_FitFailed": int((r == "fit_failed").sum()),
+            "Clean_GapEdge": int((r == "gap_edge").sum()), "Clean_Spike": int((r == "spike").sum()),
+            "Clean_Filled": int((r != "ok").sum() - df["FastTDA_clean"].isna().sum()),
+            "Clean_NaN": int(df["FastTDA_clean"].isna().sum())}
+
+
 def quality_metrics(df: pd.DataFrame) -> dict:
     """Reliability of a FastTDA series (no label needed)."""
     v = df["FastTDA"].to_numpy(float)
@@ -397,13 +467,15 @@ def run_settings(settings, stage, t, x, pos, fs, step, stride, vr_model, done):
         t0 = time.time()
         df = extract_profile(t, x, pos, w, d, step, stride, vr_model)
         m = quality_metrics(df)
+        df = clean_fasttda(df, fs, step)
+        c = clean_report(df)
         done[(w, d)] = df
         rows.append({
             "Profile": name, "Stage": stage,
             "Window_Size": w, "Window_s": w / fs, "Takens_Delay": d, "Delay_s": d / fs,
             "Points_per_Window": n_points, "Windows": len(df),
             "FastTDA_Invalid_Count": int((~df["FastTDA_FitOK"]).sum()),
-            **m,
+            **m, **c,
             "Signal_Column": SIGNAL_COL, "Sampling_Hz": fs, "Lowpass_Hz": CUTOFF,
             "Window_Step": step, "Takens_Stride": stride,
             "Runtime_s": time.time() - t0,
@@ -411,6 +483,10 @@ def run_settings(settings, stage, t, x, pos, fs, step, stride, vr_model, done):
         print(f"  [{stage} {i}/{len(todo)}] {name:10s} window {w / fs:5.2f} s, delay {d / fs:.3f} s | "
               f"invalid {m['Invalid_pct']:5.2f}%  spikes {m['Spike_pct']:5.2f}%  "
               f"roughness {m['Roughness']:.3f}")
+        if stage == "final":
+            print(f"  Cleaning: {c['Clean_Startup']} start-up, {c['Clean_FitFailed']} failed fits, "
+                  f"{c['Clean_GapEdge']} gap edges, {c['Clean_Spike']} spikes masked -> "
+                  f"{c['Clean_Filled']} filled by interpolation, {c['Clean_NaN']} left empty (NaN)")
     return rows
 
 

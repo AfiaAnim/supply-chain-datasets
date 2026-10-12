@@ -3,6 +3,7 @@ Visualize the FastTDA fine-tuning results produced by trial_fasttda_finetune.py.
 
 Figures:
     1. Signal (raw + filtered capacitance) and FastTDA (2b) over time for one profile
+       (raw FastTDA in grey + cleaned FastTDA_clean in blue, if the results have it)
     2. FastTDA over time for the top-ranked settings (small multiples, shared y-axis)
     3. Grid overview heatmaps (coarse grid): invalid-fit rate and tuning score
     4. Example windows: Takens point cloud with the fitted FastTDA ellipse
@@ -159,16 +160,37 @@ def fig_signal_and_fasttda(df_csv, prof_df, prof_name, out_dir):
     ax1.set_title("Capacitance signal")
     ax1.legend(loc="upper right", ncol=2)
 
-    ax2.plot(prof_df["Time"], prof_df["FastTDA"], color=SERIES[0], lw=1.5, label="FastTDA (2b)")
+    has_clean = "FastTDA_clean" in prof_df
+    raw = prof_df["FastTDA"].to_numpy(float)
+    if has_clean:
+        # Raw output in grey behind, cleaned series on top; y-range follows the cleaned values
+        ax2.plot(prof_df["Time"], raw, color=NEUTRAL, lw=0.8, label="FastTDA raw")
+        ax2.plot(prof_df["Time"], prof_df["FastTDA_clean"], color=SERIES[0], lw=1.5,
+                 label="FastTDA clean")
+        c = prof_df["FastTDA_clean"].to_numpy(float)
+        lo, hi = np.nanmin(c), np.nanmax(c)
+        ax2.set_ylim(lo - 0.15 * (hi - lo), hi + 0.1 * (hi - lo))
+        n_over = int(np.sum(raw > hi + 0.1 * (hi - lo)))
+        if n_over:
+            ax2.text(0.01, 0.97, f"{n_over} raw spikes above the axis (masked in clean)",
+                     transform=ax2.transAxes, va="top", fontsize=8, color=TEXT_2)
+        y0 = lo - 0.1 * (hi - lo)
+    else:
+        ax2.plot(prof_df["Time"], raw, color=SERIES[0], lw=1.5, label="FastTDA (2b)")
+        y0 = np.nanmin(raw)
     bad = prof_df[~prof_df["FastTDA_FitOK"].astype(bool)]
     if len(bad):
-        y0 = np.nanmin(prof_df["FastTDA"])
         ax2.plot(bad["Time"], np.full(len(bad), y0), "|", color=SERIES[1], ms=8, mew=1,
                  label=f"invalid ellipse fit ({len(bad)} windows)")
+    if has_clean:
+        start = prof_df.loc[prof_df["Clean_Mask"] == "startup", "Time"]
+        if len(start):
+            ax2.axvspan(prof_df["Time"].iloc[0], start.max(), color=GRID, alpha=0.6, lw=0,
+                        label="start-up (dropped)")
     ax2.set_ylabel("FastTDA minor axis 2b")
     ax2.set_xlabel("Time (s), window end")
     ax2.set_title(f"FastTDA over time - profile {prof_name}")
-    ax2.legend(loc="upper right")
+    ax2.legend(loc="upper right", ncol=2)
     save(fig, out_dir, "fig1_signal_fasttda.png")
 
 
