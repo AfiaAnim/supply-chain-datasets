@@ -84,6 +84,9 @@ DETREND_OPTIONS = [False, True]         # fine-tuning also tries removing each w
                                         # (the slow capacitance drift can stop the ellipse fit)
 MAX_DELAY_FRACTION = 0.25               # skip settings whose delay > this fraction of the window
 RESOLUTION_WEIGHT = 1.0                 # weight of "shorter window" in the score (0 = ignore)
+MIN_CYCLES_PER_WINDOW = 1.0             # a window must hold at least this many cycles of the
+                                        # dominant oscillation (else the TDA loop is only a partial
+                                        # arc); 0 = no limit. Dominant frequency is found per trial.
 TUNE_FROM_FIRST_FIT_OK = True           # score only from where FastTDA_FitOK first turns True
 FIT_OK_RUN_S = 1.0                      # ... and stays True this long (skips the start-up)
 
@@ -263,6 +266,7 @@ def run_grid(settings, stage, trials, done):
     todo = [(w, d, dt) for w, d, dt in settings
             if (w, d, dt) not in done and d <= MAX_DELAY_FRACTION * w
             and all(w <= len(tr["x"]) for tr in trials)
+            and all(w / tr["fs"] * tr["f_dom"] >= MIN_CYCLES_PER_WINDOW for tr in trials)
             and (w - d * (TAKENS_DIM - 1) - 1) // TAKENS_STRIDE + 1 >= 5]
     fs = np.mean([tr["fs"] for tr in trials])
     for i, (w, d, dt) in enumerate(todo, 1):
@@ -275,6 +279,7 @@ def run_grid(settings, stage, trials, done):
         p = pd.DataFrame(per)
         r = {k: per[0][k] for k in ("Profile", "Window_Size", "Takens_Delay", "Detrend")}
         r.update({"Window_s": w / fs, "Delay_s": d / fs, "Stage": stage, "Trials": len(per),
+                  "Min_Cycles_per_Window": min(w / tr["fs"] * tr["f_dom"] for tr in trials),
                   "Tune_From_s": p["Tune_From_s"].mean(), "Invalid_pct": p["Invalid_pct"].mean(),
                   "Worst_Invalid_pct": p["Invalid_pct"].max(), "Spike_pct": p["Spike_pct"].mean(),
                   "Roughness": p["Roughness"].mean(), "FastTDA_median": p["FastTDA_median"].mean()})
@@ -293,8 +298,16 @@ def fine_tune(trials):
     done = set()
     coarse = sorted({(int(round(w * fs)), max(1, int(round(d * fs))), bool(dt))
                      for w in WINDOW_S for d in DELAY_S for dt in DETREND_OPTIONS})
-    print(f"\nFine-tuning on {names}\nStage 1: coarse grid, {len(coarse)} settings")
+    print(f"\nFine-tuning on {names}")
+    if MIN_CYCLES_PER_WINDOW:
+        min_w = max(MIN_CYCLES_PER_WINDOW / tr["f_dom"] for tr in trials)
+        print(f"Windows shorter than {min_w:.2f} s ({MIN_CYCLES_PER_WINDOW:g} cycle of the slowest "
+              f"dominant oscillation) are skipped")
+    print(f"Stage 1: coarse grid, {len(coarse)} settings")
     rows, detail = run_grid(coarse, "coarse", trials, done)
+    if not rows:
+        raise RuntimeError("No setting passed MIN_CYCLES_PER_WINDOW; add longer windows to WINDOW_S "
+                           "or lower MIN_CYCLES_PER_WINDOW.")
     best = add_scores(pd.DataFrame(rows)).iloc[0]
     bw, bd, bdt = int(best["Window_Size"]), int(best["Takens_Delay"]), bool(best["Detrend"])
     refine = sorted({(max(3, int(round(bw * fw))), max(1, int(round(bd * fd))), bdt)
@@ -472,8 +485,12 @@ def load_trial(path):
             raise ValueError(f"LOWPASS_HZ must be below {fs / 2:.1f} Hz")
         x = signal.sosfiltfilt(signal.butter(FILTER_ORDER, LOWPASS_HZ, btype="lowpass", fs=fs, output="sos"), x)
     name = os.path.splitext(os.path.basename(csv_path))[0]
-    print(f"Loaded {name}: {len(x)} samples, {fs:.2f} Hz, {t[-1] - t[0]:.1f} s")
-    return {"name": name, "path": csv_path, "out_dir": os.path.dirname(csv_path),
+    f, pxx = signal.welch(x - x.mean(), fs=fs, nperseg=int(min(len(x), max(256, 20 * fs))))
+    band = f >= 0.2                                     # ignore the slow drift
+    f_dom = float(f[band][np.argmax(pxx[band])])
+    print(f"Loaded {name}: {len(x)} samples, {fs:.2f} Hz, {t[-1] - t[0]:.1f} s, "
+          f"dominant oscillation {f_dom:.2f} Hz (period {1 / f_dom:.2f} s)")
+    return {"f_dom": f_dom, "name": name, "path": csv_path, "out_dir": os.path.dirname(csv_path),
             "t": t, "x": x, "label": data[LABEL_COL].to_numpy(float), "fs": fs}
 
 
@@ -494,7 +511,8 @@ def save_workbook(path, sheets):
 
 
 def print_top(summary):
-    cols = ["Rank", "Profile", "Stage", "Window_s", "Delay_s", "Detrend", "Tune_From_s", "Invalid_pct",
+    cols = ["Rank", "Profile", "Stage", "Window_s", "Delay_s", "Detrend", "Min_Cycles_per_Window",
+            "Tune_From_s", "Invalid_pct",
             "Worst_Invalid_pct", "Spike_pct", "Roughness", "FastTDA_median", "Score"]
     print(summary[[c for c in cols if c in summary]].head(10).round(4).to_string(index=False))
 
