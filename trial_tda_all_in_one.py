@@ -87,6 +87,7 @@ RESOLUTION_WEIGHT = 1.0                 # weight of "shorter window" in the scor
 MIN_CYCLES_PER_WINDOW = 1.0             # a window must hold at least this many cycles of the
                                         # dominant oscillation (else the TDA loop is only a partial
                                         # arc); 0 = no limit. Dominant frequency is found per trial.
+F_DOM_MIN_HZ = 0.3                      # dominant oscillation is searched above this frequency
 TUNE_FROM_FIRST_FIT_OK = True           # score only from where FastTDA_FitOK first turns True
 FIT_OK_RUN_S = 1.0                      # ... and stays True this long (skips the start-up)
 
@@ -260,13 +261,14 @@ def add_scores(summary):
     return s
 
 
-def run_grid(settings, stage, trials, done):
+def run_grid(settings, stage, trials, done, min_cycles=None):
     """Score each setting on every trial; the tuning metrics are averaged over the trials."""
     rows, detail = [], []
+    min_cycles = MIN_CYCLES_PER_WINDOW if min_cycles is None else min_cycles
     todo = [(w, d, dt) for w, d, dt in settings
             if (w, d, dt) not in done and d <= MAX_DELAY_FRACTION * w
             and all(w <= len(tr["x"]) for tr in trials)
-            and all(w / tr["fs"] * tr["f_dom"] >= MIN_CYCLES_PER_WINDOW for tr in trials)
+            and all(w / tr["fs"] * tr["f_dom"] >= min_cycles for tr in trials)
             and (w - d * (TAKENS_DIM - 1) - 1) // TAKENS_STRIDE + 1 >= 5]
     fs = np.mean([tr["fs"] for tr in trials])
     for i, (w, d, dt) in enumerate(todo, 1):
@@ -304,17 +306,22 @@ def fine_tune(trials):
         print(f"Windows shorter than {min_w:.2f} s ({MIN_CYCLES_PER_WINDOW:g} cycle of the slowest "
               f"dominant oscillation) are skipped")
     print(f"Stage 1: coarse grid, {len(coarse)} settings")
-    rows, detail = run_grid(coarse, "coarse", trials, done)
+    min_cycles = MIN_CYCLES_PER_WINDOW
+    rows, detail = run_grid(coarse, "coarse", trials, done, min_cycles)
     if not rows:
-        raise RuntimeError("No setting passed MIN_CYCLES_PER_WINDOW; add longer windows to WINDOW_S "
-                           "or lower MIN_CYCLES_PER_WINDOW.")
+        min_cycles = 0
+        print(f"  WARNING: no window in WINDOW_S (max {max(WINDOW_S)} s) holds {MIN_CYCLES_PER_WINDOW:g} "
+              f"cycle(s); dominant frequencies found: "
+              + ", ".join(f"{tr['name']} {tr['f_dom']:.2f} Hz" for tr in trials)
+              + ". Tuning without the cycle limit - check these frequencies or add longer windows.")
+        rows, detail = run_grid(coarse, "coarse", trials, done, min_cycles)
     best = add_scores(pd.DataFrame(rows)).iloc[0]
     bw, bd, bdt = int(best["Window_Size"]), int(best["Takens_Delay"]), bool(best["Detrend"])
     refine = sorted({(max(3, int(round(bw * fw))), max(1, int(round(bd * fd))), bdt)
                      for fw in REFINE_WINDOW_FACTORS for fd in REFINE_DELAY_FACTORS})
     n_new = len([r for r in refine if r not in done])
     print(f"\nStage 2: refine around {best['Profile']}, {n_new} new settings")
-    r2, d2 = run_grid(refine, "refine", trials, done)
+    r2, d2 = run_grid(refine, "refine", trials, done, min_cycles)
     return add_scores(pd.DataFrame(rows + r2)), pd.DataFrame(detail + d2)
 
 
@@ -485,8 +492,11 @@ def load_trial(path):
             raise ValueError(f"LOWPASS_HZ must be below {fs / 2:.1f} Hz")
         x = signal.sosfiltfilt(signal.butter(FILTER_ORDER, LOWPASS_HZ, btype="lowpass", fs=fs, output="sos"), x)
     name = os.path.splitext(os.path.basename(csv_path))[0]
-    f, pxx = signal.welch(x - x.mean(), fs=fs, nperseg=int(min(len(x), max(256, 20 * fs))))
-    band = f >= 0.2                                     # ignore the slow drift
+    # Dominant oscillation: remove the slow drift first (5 s moving average), else it wins the spectrum
+    k = max(3, int(round(5 * fs)) | 1)
+    x_hp = x - pd.Series(x).rolling(k, center=True, min_periods=1).mean().to_numpy()
+    f, pxx = signal.welch(x_hp, fs=fs, nperseg=int(min(len(x), max(256, 20 * fs))), detrend="linear")
+    band = f >= F_DOM_MIN_HZ
     f_dom = float(f[band][np.argmax(pxx[band])])
     print(f"Loaded {name}: {len(x)} samples, {fs:.2f} Hz, {t[-1] - t[0]:.1f} s, "
           f"dominant oscillation {f_dom:.2f} Hz (period {1 / f_dom:.2f} s)")
