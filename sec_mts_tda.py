@@ -107,6 +107,7 @@ TAKENS_STRIDE = 1
 MAX_POINTS = 300                        # long windows: embed every k-th point so a cloud has <= this many
 TIME_LABEL = "midpoint"
 COMPUTE_VR = True                       # needs giotto-tda
+VR_JOBS = -1                            # CPU cores for VR (-1 = all); falls back to 1 if the workers crash
 COMPUTE_ALPHA = True                    # needs gudhi
 
 # Cleaning / smoothing of VR, Alpha and FastTDA
@@ -221,7 +222,11 @@ def fasttda_minor_axis(pc):
 
 def vr_max_h1_batch(clouds):
     from gtda.homology import VietorisRipsPersistence
-    diagrams = VietorisRipsPersistence(homology_dimensions=[1], n_jobs=-1).fit_transform(clouds)
+    try:
+        diagrams = VietorisRipsPersistence(homology_dimensions=[1], n_jobs=VR_JOBS).fit_transform(clouds)
+    except Exception as e:                              # e.g. BrokenProcessPool: workers can't import gtda
+        print(f"    VR in parallel failed ({type(e).__name__}) - running on one core")
+        diagrams = VietorisRipsPersistence(homology_dimensions=[1], n_jobs=1).fit_transform(clouds)
     pers = diagrams[:, :, 1] - diagrams[:, :, 0]
     pers[(diagrams[:, :, 2] != 1) | ~np.isfinite(pers)] = 0.0
     return pers.max(axis=1)
