@@ -95,7 +95,7 @@ RESOLUTION_WEIGHT = 1.0                 # weight of "shorter window" in the scor
 TARGET_WEIGHT = 2.0                     # weight of |correlation with the MTS target| in the score
 TUNE_TARGET = "auto"                    # "auto" = best of the target stats below, or e.g. "Displacement_m:std"
 TARGET_STATS = ["mean", "std"]          # per window: mean = level, std = cyclic amplitude
-TUNE_STEP = 2                           # score every 4th window while tuning (speed); final uses all
+TUNE_STEP = 2                           # score every 2nd window while tuning (speed); final uses all
 FIT_OK_RUN_S = 1.0                      # tuning starts where FastTDA_FitOK first stays True this long
 
 # Embedding / windows
