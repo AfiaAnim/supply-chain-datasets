@@ -68,6 +68,9 @@ MTS_TIME_COL = "RunningTime_s"
 TARGET_COLS = ["Displacement_m", "Force_N"]
 LABEL_TARGET = "Displacement_m"         # 2nd column of the W<window> sheet (like CartLocation)
 
+RESAMPLE_HZ = 20.0                      # SEC is resampled to this rate (anti-aliased) before TDA;
+                                        # the loading is slow (40 s cycles), 261 Hz is not needed. None = keep
+
 # Time alignment: MTS time = SEC time (from SEC start) - offset
 OFFSET_GUESS_S = 10.0                   # "the two correspond from about 10 s of SEC"
 OFFSET_SEARCH_S = 5.0                   # search the offset within guess +- this (0 = use the guess)
@@ -78,8 +81,8 @@ MODE = "auto"                           # "auto" = fine-tune; "fixed" = use FIXE
 FIXED_WINDOW, FIXED_DELAY, FIXED_DETREND = 79, 8, True
 
 # Fine-tuning grid (seconds) and refine multipliers
-WINDOW_S = [0.75, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0]
-DELAY_S = [0.03, 0.06, 0.09, 0.12, 0.16, 0.20, 0.25]
+WINDOW_S = [2.0, 4.0, 8.0, 12.0, 16.0, 24.0, 32.0, 40.0]       # up to one 40 s loading cycle
+DELAY_S = [0.25, 0.5, 1.0, 2.0, 3.0, 5.0, 8.0, 10.0]
 REFINE_WINDOW_FACTORS = [0.8, 0.9, 1.0, 1.1, 1.2]
 REFINE_DELAY_FACTORS = [0.75, 0.875, 1.0, 1.125, 1.25]
 DETREND_OPTIONS = [False, True]
@@ -88,13 +91,14 @@ RESOLUTION_WEIGHT = 1.0                 # weight of "shorter window" in the scor
 TARGET_WEIGHT = 2.0                     # weight of |correlation with the MTS target| in the score
 TUNE_TARGET = "auto"                    # "auto" = best of the target stats below, or e.g. "Displacement_m:std"
 TARGET_STATS = ["mean", "std"]          # per window: mean = level, std = cyclic amplitude
-TUNE_STEP = 4                           # score every 4th window while tuning (speed); final uses all
+TUNE_STEP = 2                           # score every 4th window while tuning (speed); final uses all
 FIT_OK_RUN_S = 1.0                      # tuning starts where FastTDA_FitOK first stays True this long
 
 # Embedding / windows
 WINDOW_STEP = 1
 TAKENS_DIM = 2
 TAKENS_STRIDE = 1
+MAX_POINTS = 300                        # long windows: embed every k-th point so a cloud has <= this many
 TIME_LABEL = "midpoint"
 COMPUTE_VR = True                       # needs giotto-tda
 COMPUTE_ALPHA = True                    # needs gudhi
@@ -103,8 +107,8 @@ COMPUTE_ALPHA = True                    # needs gudhi
 TRIM_START_S = 0.0                      # extra trim after the aligned start (the SEC start-up is already cut)
 EDGE_GUARD_WINDOWS = 5
 SPIKE_MADS = 6.0
-MAX_INTERP_GAP_S = 1.0
-SMOOTH_S = 0.25
+MAX_INTERP_GAP_S = 2.0
+SMOOTH_S = 1.0
 CLEAN_FEATURES = ["VR", "Alpha", "FastTDA"]
 
 
@@ -149,13 +153,19 @@ def window_matrix(x, window, step, detrend):
     return 2 * (W - lo) / span - 1
 
 
+def embed_stride(window, delay):
+    span = window - (TAKENS_DIM - 1) * delay - 1
+    return max(TAKENS_STRIDE, int(np.ceil((span + 1) / MAX_POINTS)) if MAX_POINTS else 1)
+
+
 def point_clouds(x, window, delay, detrend, step=WINDOW_STEP):
     """Takens point clouds (same indexing as gtda TakensEmbedding, aligned to the window end)."""
     W = window_matrix(x, window, step, detrend)
+    stride = embed_stride(window, delay)
     span = window - (TAKENS_DIM - 1) * delay - 1
-    first = span % TAKENS_STRIDE
-    last = first + (span // TAKENS_STRIDE) * TAKENS_STRIDE
-    cols = [W[:, first + d * delay: last + d * delay + 1: TAKENS_STRIDE] for d in range(TAKENS_DIM)]
+    first = span % stride
+    last = first + (span // stride) * stride
+    cols = [W[:, first + d * delay: last + d * delay + 1: stride] for d in range(TAKENS_DIM)]
     starts = np.arange(0, len(x) - window + 1, step)
     return starts, np.stack(cols, axis=2)
 
@@ -255,21 +265,16 @@ def estimate_offset(t_sec, x_sec, t_mts, y_mts):
     """Offset (s) with MTS time = SEC time - offset, from the cross-correlation peak."""
     if not OFFSET_SEARCH_S:
         return OFFSET_GUESS_S, np.nan
-    fs = 50.0
-    g = np.arange(0, t_sec[-1], 1 / fs)
-    a = np.interp(g, t_sec, x_sec)
-    k = int(2 * fs) | 1                                  # remove the slow drift (2 s moving average)
-    a = a - pd.Series(a).rolling(k, center=True, min_periods=1).mean().to_numpy()
-    gm = np.arange(0, t_mts[-1], 1 / fs)
-    b = np.interp(gm, t_mts, y_mts)
-    b = b - pd.Series(b).rolling(k, center=True, min_periods=1).mean().to_numpy()
+    fs = 10.0                                            # the loading is slow: 10 Hz is enough
+    a = np.interp(np.arange(0, t_sec[-1], 1 / fs), t_sec, x_sec)
+    b = np.interp(np.arange(0, t_mts[-1], 1 / fs), t_mts, y_mts)
     best = (OFFSET_GUESS_S, 0.0)
     for lag in np.arange(OFFSET_GUESS_S - OFFSET_SEARCH_S, OFFSET_GUESS_S + OFFSET_SEARCH_S + 1e-9, 1 / fs):
         i0 = int(round(lag * fs))
         if i0 < 0:
             continue
         n = min(len(b), len(a) - i0)
-        if n < 10 * fs:
+        if n < 0.9 * len(b):                             # need (almost) the whole MTS record
             continue
         aa, bb = a[i0:i0 + n], b[:n]
         if aa.std() == 0 or bb.std() == 0:
@@ -300,10 +305,15 @@ def load_pair(name, num, sec_path, mts_path):
     fs = (len(t_sec) - 1) / (t_sec[-1] - t_sec[0])
 
     offset, r = estimate_offset(t_sec, x, t_mts, mts[OFFSET_REF_COL].to_numpy(float))
+    if RESAMPLE_HZ and RESAMPLE_HZ < fs:                            # anti-alias, then resample
+        sos = signal.butter(4, 0.4 * RESAMPLE_HZ, btype="lowpass", fs=fs, output="sos")
+        x = signal.sosfiltfilt(sos, x)
+        t_new = np.arange(t_sec[0], t_sec[-1], 1 / RESAMPLE_HZ)
+        x, t_sec, fs = np.interp(t_new, t_sec, x), t_new, RESAMPLE_HZ
     keep = (t_sec >= offset) & (t_sec <= offset + t_mts[-1])        # overlap only
     t_al = t_sec[keep] - offset                                     # aligned = MTS time
     targets = {c: np.interp(t_al, t_mts, mts[c].to_numpy(float)) for c in TARGET_COLS}
-    print(f"  {name}: SEC {t_sec[-1]:.1f} s at {fs:.1f} Hz, MTS {t_mts[-1]:.1f} s | offset {offset:.2f} s"
+    print(f"  {name}: SEC {t_sec[-1]:.1f} s ({fs:.0f} Hz used), MTS {t_mts[-1]:.1f} s | offset {offset:.2f} s"
           + (f" (|corr| {r:.2f})" if np.isfinite(r) else "")
           + f" | kept SEC {offset:.1f}-{offset + t_mts[-1]:.1f} s ({keep.sum()} samples)")
     return {"name": name, "num": num, "t": t_al, "x": x[keep], "fs": fs, "targets": targets,
@@ -373,7 +383,7 @@ def run_grid(settings, stage, trials, done):
     todo = [(w, d, dt) for w, d, dt in settings
             if (w, d, dt) not in done and d <= MAX_DELAY_FRACTION * w
             and all(w <= len(tr["x"]) for tr in trials)
-            and (w - d * (TAKENS_DIM - 1) - 1) // TAKENS_STRIDE + 1 >= 5]
+            and (w - d * (TAKENS_DIM - 1) - 1) // embed_stride(w, d) + 1 >= 5]
     for i, (w, d, dt) in enumerate(todo, 1):
         per = pd.DataFrame([score_setting(tr, w, d, dt) for tr in trials])
         r = {"Profile": profile_name(w, d, dt), "Window_Size": w, "Takens_Delay": d, "Detrend": dt,
@@ -619,7 +629,7 @@ def process_trial(tr, window, delay, detrend, best_key, summary, note, out_dir):
     cdf = clean_profile(df, t_end, tr["fs"])
     meta = {"Profile": f"W{window}", "Dataset": tr["name"], "Sampling_Hz": round(tr["fs"], 4),
             "Lowpass_Hz": None, "Filter_Order": None, "Window_Size": window, "Window_Step": WINDOW_STEP,
-            "Takens_Delay": delay, "Takens_Dimension": TAKENS_DIM, "Takens_Stride": TAKENS_STRIDE,
+            "Takens_Delay": delay, "Takens_Dimension": TAKENS_DIM, "Takens_Stride": embed_stride(window, delay),
             "Time_Label": TIME_LABEL, "Rows": len(df), "FastTDA_Invalid_Count": n_bad, "Note": note,
             "Detrend": detrend, "SEC_MTS_Offset_s": tr["offset"], "Offset_Corr": tr["offset_corr"],
             "Target": best_key}
@@ -641,6 +651,12 @@ def process_trial(tr, window, delay, detrend, best_key, summary, note, out_dir):
             stats[f"{col}~{k}"] = rho
         rhos[col] = row[best_key]
         table.append(row)
+    base = {"Feature": f"SEC {SEC_COL} (no TDA, window mean)"}
+    cap_mean, _ = window_stats(tr["x"], window, WINDOW_STEP)
+    for k in target_keys():
+        base[k] = spearman(cap_mean, tg[k].to_numpy(float))
+        stats[f"Capacitance~{k}"] = base[k]
+    table.append(base)
     print(pd.DataFrame(table).round(3).to_string(index=False))
     save_workbook(os.path.join(out_dir, f"{tr['name']}_SEC_MTS_TDA.xlsx"), {
         f"W{window}": df, "Targets": tg, f"W{window}_Cleaned": cdf,
