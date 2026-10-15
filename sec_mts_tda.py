@@ -54,9 +54,11 @@ except Exception:
 # SETTINGS
 # ============================================================
 
-DATA_DIR = r"C:\Users\aphya\Downloads\data\processed"   # folder that holds sec\ and mts\
+DATA_DIR = "."                          # "." = the Jupyter notebook's folder (where uploaded files land).
+                                        # SEC and MTS csv files can sit together in this folder (or in
+                                        # sec\ and mts\ subfolders); each file is recognised by its columns
 SEC_SUBDIR, MTS_SUBDIR = "sec", "mts"
-OUTPUT_DIR = None                       # None = DATA_DIR\tda_results
+OUTPUT_DIR = None                       # None = DATA_DIR/tda_results
 TRIALS = None                           # None = every trial found; or e.g. ["trial_04", "trial_05"]
 TUNE_FROM_TRIAL = 4                     # tune on trial_04 onward (updated setup); 1-3 are processed only
 
@@ -246,22 +248,51 @@ def alpha_max_h1(pc):
 # LOADING + TIME ALIGNMENT
 # ============================================================
 
+def file_kind(path):
+    """'sec' or 'mts' from the csv header (file names are not reliable: trial_01_1 is MTS,
+    trial_04_1 is SEC)."""
+    try:
+        with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
+            header = f.readline()
+    except OSError:
+        return None
+    if SEC_COL in header:
+        return "sec"
+    if MTS_TIME_COL in header and all(c in header for c in TARGET_COLS):
+        return "mts"
+    return None
+
+
 def find_pairs():
     base = to_local_path(DATA_DIR)
-    sec_files = sorted(glob.glob(os.path.join(base, SEC_SUBDIR, "*.csv")))
-    mts_files = {trial_key(p)[0]: p for p in glob.glob(os.path.join(base, MTS_SUBDIR, "*.csv"))}
-    if not sec_files:
-        raise FileNotFoundError(f"No SEC csv files in {os.path.join(base, SEC_SUBDIR)}")
-    pairs = []
-    for p in sec_files:
+    files = glob.glob(os.path.join(base, "*.csv"))
+    for sub in (SEC_SUBDIR, MTS_SUBDIR):
+        files += glob.glob(os.path.join(base, sub, "*.csv"))
+    sec, mts = {}, {}
+    for p in sorted(files):
         name, num = trial_key(p)
-        if name is None or (TRIALS and name not in TRIALS):
+        kind = file_kind(p) if name else None
+        if kind is None:
             continue
-        if name not in mts_files:
-            print(f"  {name}: no MTS file with the same trial number - skipped")
+        group = sec if kind == "sec" else mts
+        if name in group:
+            print(f"  {name}: two {kind.upper()} files ({os.path.basename(group[name][1])}, "
+                  f"{os.path.basename(p)}) - using the first")
             continue
-        pairs.append((name, num, p, mts_files[name]))
-    print(f"Found {len(pairs)} SEC/MTS pairs: " + ", ".join(n for n, *_ in pairs))
+        group[name] = (num, p)
+    if not sec:
+        raise FileNotFoundError(f"No SEC csv files (with a {SEC_COL!r} column) found in {os.path.abspath(base)}")
+    pairs = []
+    for name in sorted(sec):
+        if TRIALS and name not in TRIALS:
+            continue
+        if name not in mts:
+            print(f"  {name}: SEC file found but no MTS file - skipped")
+            continue
+        num, sp = sec[name]
+        pairs.append((name, num, sp, mts[name][1]))
+        print(f"  {name}: SEC {os.path.basename(sp)}  +  MTS {os.path.basename(mts[name][1])}")
+    print(f"Found {len(pairs)} SEC/MTS pairs in {os.path.abspath(base)}")
     return pairs
 
 
