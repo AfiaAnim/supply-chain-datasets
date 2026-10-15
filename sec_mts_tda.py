@@ -24,7 +24,8 @@ Output (in OUTPUT_DIR):
                                Targets (window mean / std of displacement and force),
                                <W>_Cleaned, Metadata, Tuning_Summary
     All_Trials_SEC_MTS_Summary.xlsx   offsets, failed fits, feature-target correlations per trial
-    <trial>_SEC_MTS_profile.png, <trial>_SEC_MTS_scatter.png, SEC_MTS_tuning.png
+    <trial>_SEC_MTS_profile.png, <trial>_SEC_MTS_scatter.png, <trial>_SEC_MTS_ellipses.png,
+    SEC_MTS_tuning.png
 
 Requirements:
     pip install numpy pandas scipy matplotlib openpyxl giotto-tda gudhi
@@ -118,6 +119,12 @@ MAX_INTERP_GAP_S = 2.0
 SMOOTH_S = 1.0
 CLEAN_FEATURES = ["VR", "Alpha", "FastTDA"]
 
+# Embedded point clouds + fitted ellipses (one figure per trial)
+PLOT_ELLIPSES = True
+ELLIPSE_TIMES = None                    # None = ELLIPSE_N windows spread over the trial;
+                                        # or window-midpoint times in s (MTS clock), e.g. [20, 60, 100]
+ELLIPSE_N = 6
+
 
 # ============================================================
 # HELPERS
@@ -193,31 +200,47 @@ def spearman(a, b):
 # FEATURES: FastTDA, VR, Alpha
 # ============================================================
 
-def fasttda_minor_axis(pc):
-    """SVD-LSE ellipse fit (A + C = 1) on a 2-D point cloud -> (2b, fit_ok)."""
+def fasttda_fit(pc):
+    """SVD-LSE ellipse fit (A + C = 1) on a 2-D point cloud.
+    Returns (2b, fit_ok, ellipse) - ellipse = dict with the curve in point-cloud coordinates, or None."""
     X, Y = pc[:, 0], pc[:, 1]
-    Xc, Yc = X - X.mean(), Y - Y.mean()
+    mx, my = X.mean(), Y.mean()
+    Xc, Yc = X - mx, Y - my
     rng = max(np.abs(Xc).max(), np.abs(Yc).max())
     if not np.isfinite(rng) or rng == 0:
-        return np.nan, False
-    Xc, Yc = Xc * 1.5 / rng, Yc * 1.5 / rng
+        return np.nan, False, None
+    k = 1.5 / rng
+    Xc, Yc = Xc * k, Yc * k
     G = np.column_stack([Xc**2 - Yc**2, Xc * Yc, Xc, Yc, np.ones_like(Xc)])
     U, S, Vt = np.linalg.svd(G, full_matrices=False)
     Sinv = np.where(S > np.finfo(float).eps * max(G.shape) * S[0], 1.0 / S, 0.0)
     A, B, D, E, F = (Vt.T * Sinv) @ (U.T @ -(Yc**2))
     C = 1.0 - A
     if 4 * A * C - B**2 <= 0:
-        return np.nan, False
+        return np.nan, False, None
     th = 0.5 * np.arctan2(B, A - C)
     c, s = np.cos(th), np.sin(th)
     Ap, Cp = A*c*c + B*c*s + C*s*s, A*s*s - B*c*s + C*c*c
     Dp, Ep = D*c + E*s, -D*s + E*c
     if Ap <= 0 or Cp <= 0:
-        return np.nan, False
+        return np.nan, False, None
     Fn = F - Dp**2 / (4 * Ap) - Ep**2 / (4 * Cp)
     if Fn >= 0:
-        return np.nan, False
-    return 2.0 * min(np.sqrt(-Fn / Ap), np.sqrt(-Fn / Cp)), True
+        return np.nan, False, None
+    a_u, a_v = np.sqrt(-Fn / Ap), np.sqrt(-Fn / Cp)            # semi-axes along the rotated u, v
+    u0, v0 = -Dp / (2 * Ap), -Ep / (2 * Cp)                    # centre in the rotated frame
+    to_pc = lambda u, v: (mx + (c * u - s * v) / k, my + (s * u + c * v) / k)
+    t = np.linspace(0, 2 * np.pi, 200)
+    ex, ey = to_pc(u0 + a_u * np.cos(t), v0 + a_v * np.sin(t))
+    minor = (u0 + np.array([-a_u, a_u]), np.array([v0, v0])) if a_u < a_v else \
+            (np.array([u0, u0]), v0 + np.array([-a_v, a_v]))
+    ell = {"x": ex, "y": ey, "center": to_pc(u0, v0), "minor": to_pc(*minor)}
+    return 2.0 * min(a_u, a_v), True, ell
+
+
+def fasttda_minor_axis(pc):
+    """FastTDA feature: minor axis 2b of the fitted ellipse (fit coordinates) -> (2b, fit_ok)."""
+    return fasttda_fit(pc)[:2]
 
 
 def vr_max_h1_batch(clouds):
@@ -644,6 +667,49 @@ def plot_scatter(tr, cdf, tg, best_key, out_dir):
     plt.show()
 
 
+def plot_ellipses(tr, df, tg, window, delay, detrend, best_key, out_dir):
+    """Takens point cloud of selected windows with the FastTDA ellipse and its minor axis."""
+    starts, clouds = point_clouds(tr["x"], window, delay, detrend)
+    tt = df["Time"].to_numpy(float)
+    if ELLIPSE_TIMES:
+        idx = [int(np.argmin(np.abs(tt - t))) for t in ELLIPSE_TIMES]
+    else:
+        idx = np.linspace(0, len(tt) - 1, ELLIPSE_N + 2)[1:-1].round().astype(int).tolist()
+    ncol = min(3, len(idx))
+    nrow = int(np.ceil(len(idx) / ncol))
+    fig, axes = plt.subplots(nrow, ncol, figsize=(4.2 * ncol, 4.5 * nrow), squeeze=False,
+                             gridspec_kw={"hspace": 0.35})
+    for ax, i in zip(axes.flat, idx):
+        pc = clouds[i]
+        v, ok, ell = fasttda_fit(pc)
+        sc = ax.scatter(pc[:, 0], pc[:, 1], c=np.arange(len(pc)), cmap="viridis", s=7, lw=0)
+        ax.plot(pc[:, 0], pc[:, 1], color="#b8b7b2", lw=0.4, zorder=0)
+        if ok:
+            ax.plot(ell["x"], ell["y"], color="#eb6834", lw=2, label="fitted ellipse")
+            ax.plot(*ell["minor"], color="#0d366b", lw=2, label=f"minor axis, FastTDA 2b = {v:.3f}")
+            ax.plot(*ell["center"], "+", color="#0d366b", ms=10, mew=2)
+        else:
+            ax.text(0.5, 0.5, "ellipse fit failed", transform=ax.transAxes, ha="center",
+                    color="#c0392b", fontweight="bold")
+        ax.set_title(f"t = {tt[i]:.1f} s | {best_key} = {tg[best_key].iloc[i]:.3g}", fontsize=9,
+                     fontweight="bold")
+        ax.set_xlabel("x(t)")
+        ax.set_ylabel(f"x(t + {delay / tr['fs']:.2f} s)")
+        ax.set_aspect("equal", adjustable="datalim")
+        ax.grid(color="#e4e3df", lw=0.6)
+        ax.spines[["top", "right"]].set_visible(False)
+        ax.legend(loc="upper left", frameon=False, fontsize=7)
+    for ax in list(axes.flat)[len(idx):]:
+        ax.set_visible(False)
+    fig.colorbar(sc, ax=axes, fraction=0.02, pad=0.02, label="point order in window")
+    fig.suptitle(f"{tr['name']}: Takens embedding of {SEC_COL} (window {window / tr['fs']:.1f} s) "
+                 f"and FastTDA ellipse fit", fontweight="bold")
+    png = os.path.join(out_dir, f"{tr['name']}_SEC_MTS_ellipses.png")
+    fig.savefig(png, dpi=150, bbox_inches="tight")
+    print(f"Saved: {png}")
+    plt.show()
+
+
 # ============================================================
 # RUN
 # ============================================================
@@ -706,6 +772,8 @@ def process_trial(tr, window, delay, detrend, best_key, summary, note, out_dir):
         "Metadata": pd.DataFrame([meta]), "Tuning_Summary": summary})
     plot_profile(tr, df, cdf, meta, best_key, rhos, out_dir)
     plot_scatter(tr, cdf, tg, best_key, out_dir)
+    if PLOT_ELLIPSES:
+        plot_ellipses(tr, df, tg, window, delay, detrend, best_key, out_dir)
     return stats
 
 
