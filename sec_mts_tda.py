@@ -125,6 +125,16 @@ ELLIPSE_TIMES = None                    # None = ELLIPSE_N windows spread over t
                                         # or window-midpoint times in s (MTS clock), e.g. [20, 60, 100]
 ELLIPSE_N = 6
 
+# Validation: short windows (several per 40 s loading cycle), non-overlapping, so every window is
+# an (almost) independent data point. Tests whether the TDA features track the displacement / force
+# WITHIN the loading cycle, and whether they add anything beyond the plain capacitance.
+VALIDATE = True
+VAL_WINDOWS_S = [2.0, 4.0, 8.0, 12.0]           # longer windows leave too few windows per trial
+VAL_DELAY_FRACTION = 0.125              # Takens delay = this x window
+VAL_TARGETS = ["Displacement_m:mean", "Force_N:mean"]
+VAL_PERMUTATIONS = 1000                 # circular-shift permutation test (respects autocorrelation)
+VAL_RELIABLE_ONLY = True                # use only trials whose SEC-MTS alignment is reliable
+
 
 # ============================================================
 # HELPERS
@@ -711,6 +721,159 @@ def plot_ellipses(tr, df, tg, window, delay, detrend, best_key, out_dir):
 
 
 # ============================================================
+# 4) VALIDATION: short windows, permutation test, partial correlation,
+#    leave-one-trial-out regression (does TDA add anything beyond capacitance?)
+# ============================================================
+
+def rank(a):
+    return pd.Series(a).rank().to_numpy(float)
+
+
+def partial_spearman(x, y, controls):
+    """Spearman correlation of x and y after removing the (rank-linear) effect of the controls."""
+    Z = np.column_stack([np.ones(len(x))] + [rank(c) for c in controls])
+    rx, ry = rank(x), rank(y)
+    ex = rx - Z @ np.linalg.lstsq(Z, rx, rcond=None)[0]
+    ey = ry - Z @ np.linalg.lstsq(Z, ry, rcond=None)[0]
+    return float(np.corrcoef(ex, ey)[0, 1])
+
+
+def circular_perm_p(groups, n_perm, seed=0):
+    groups = [(x, y) for x, y in groups if len(x) >= 3]
+    """p-value of the pooled |Spearman| when the target of each trial is circularly shifted by a
+    random amount: keeps the autocorrelation of both series, breaks their alignment."""
+    rng = np.random.default_rng(seed)
+    obs = abs(spearman(np.concatenate([g[0] for g in groups]), np.concatenate([g[1] for g in groups])))
+    hits = 0
+    for _ in range(n_perm):
+        ys = []
+        for x, y in groups:
+            n = len(y)
+            ys.append(np.roll(y, rng.integers(max(1, n // 10), max(2, n - n // 10))))
+        r = abs(spearman(np.concatenate([g[0] for g in groups]), np.concatenate(ys)))
+        hits += r >= obs
+    return (hits + 1) / (n_perm + 1)
+
+
+def loto_r2(frames, target, cols):
+    """Leave-one-trial-out R2 of a linear model target ~ cols (fit on the other trials)."""
+    pred, true = [], []
+    for i, test in enumerate(frames):
+        train = pd.concat([f for j, f in enumerate(frames) if j != i])
+        X = np.column_stack([np.ones(len(train))] + [train[c] for c in cols])
+        beta = np.linalg.lstsq(X, train[target].to_numpy(float), rcond=None)[0]
+        Xt = np.column_stack([np.ones(len(test))] + [test[c] for c in cols])
+        pred.append(Xt @ beta)
+        true.append(test[target].to_numpy(float))
+    p, t = np.concatenate(pred), np.concatenate(true)
+    return 1 - np.sum((t - p) ** 2) / np.sum((t - t.mean()) ** 2)
+
+
+def short_window_table(tr, window, delay):
+    """Non-overlapping windows: TDA features, capacitance mean / std and targets."""
+    starts, clouds = point_clouds(tr["x"], window, delay, False, step=window)
+    ftda = np.array([fasttda_minor_axis(pc)[0] for pc in clouds])
+    out = {"Trial": tr["name"], "Time": tr["t"][starts + window // 2], "FastTDA": ftda,
+           "FastTDA_ZeroInvalid": np.where(np.isfinite(ftda), ftda, 0.0),
+           "FastTDA_FitOK": np.isfinite(ftda).astype(float)}
+    if COMPUTE_VR:
+        out["VR"] = vr_max_h1_batch(clouds)
+    if COMPUTE_ALPHA:
+        out["Alpha"] = np.array([alpha_max_h1(pc) for pc in clouds])
+    cap_mean, out["Cap_std"] = window_stats(tr["x"], window, window)
+    out["Cap_mean"] = cap_mean - np.median(cap_mean)    # zero per trial: the baseline differs between
+    for c in TARGET_COLS:                               # trials (trial_04 sits ~0.15 pF higher)
+        out[f"{c}:mean"], out[f"{c}:std"] = window_stats(tr["targets"][c], window, window)
+    return pd.DataFrame(out)
+
+
+def validate(trials, out_dir):
+    use = [tr for tr in trials if tr["offset_ok"]] if VAL_RELIABLE_ONLY else trials
+    if len(use) < 2:
+        print("\nValidation skipped: needs at least 2 trials with a reliable alignment.")
+        return None
+    fs = use[0]["fs"]
+    feats = ["FastTDA"] + (["VR"] if COMPUTE_VR else []) + (["Alpha"] if COMPUTE_ALPHA else [])
+    reg_tda = ["FastTDA_ZeroInvalid", "FastTDA_FitOK"] + feats[1:]     # regression needs no NaNs
+    print(f"\n=== VALIDATION on {', '.join(tr['name'] for tr in use)}: non-overlapping windows ===")
+    rows, all_frames = [], []
+    for ws in VAL_WINDOWS_S:
+        w = int(round(ws * fs))
+        d = max(1, int(round(VAL_DELAY_FRACTION * w)))
+        frames = [short_window_table(tr, w, d) for tr in use]
+        frames = [f.replace([np.inf, -np.inf], np.nan) for f in frames]
+        pooled = pd.concat(frames, ignore_index=True)
+        all_frames.append(pooled.assign(Window_s=ws))
+        for tgt in VAL_TARGETS:
+            r2_base = loto_r2(frames, tgt, ["Cap_mean", "Cap_std"])
+            r2_tda = loto_r2(frames, tgt, ["Cap_mean", "Cap_std"] + reg_tda)
+            for f in ["Cap_mean"] + feats:
+                groups = [(fr[f].to_numpy(float), fr[tgt].to_numpy(float)) for fr in frames]
+                groups = [(a[np.isfinite(a)], b[np.isfinite(a)]) for a, b in groups]
+                row = {"Window_s": ws, "Delay_s": d / fs, "Target": tgt, "Feature": f,
+                       "N_windows": len(pooled), "Valid_pct": 100 * pooled[f].notna().mean(),
+                       "Spearman_pooled": spearman(pooled[f].to_numpy(float), pooled[tgt].to_numpy(float)),
+                       "Spearman_per_trial_mean": np.mean([r for r in (spearman(a, b) for a, b in groups)
+                                                           if np.isfinite(r)] or [np.nan]),
+                       "Perm_p": circular_perm_p(groups, VAL_PERMUTATIONS)}
+                if f != "Cap_mean":
+                    m = pooled[f].notna()
+                    row["Partial_rho_given_Cap"] = partial_spearman(
+                        pooled.loc[m, f].to_numpy(float), pooled.loc[m, tgt].to_numpy(float),
+                        [pooled.loc[m, "Cap_mean"].to_numpy(float), pooled.loc[m, "Cap_std"].to_numpy(float)])
+                row["LOTO_R2_capacitance"] = r2_base
+                row["LOTO_R2_capacitance+TDA"] = r2_tda
+                rows.append(row)
+        print(f"  window {ws:4.1f} s: {len(pooled)} windows")
+    val = pd.DataFrame(rows)
+    show = ["Window_s", "Target", "Feature", "N_windows", "Valid_pct", "Spearman_pooled", "Perm_p",
+            "Partial_rho_given_Cap", "LOTO_R2_capacitance", "LOTO_R2_capacitance+TDA"]
+    print(val[show].round(3).to_string(index=False))
+    plot_validation(val, feats, out_dir)
+    return val, pd.concat(all_frames, ignore_index=True)
+
+
+def plot_validation(val, feats, out_dir):
+    colors = {"Cap_mean": "#52514e", "FastTDA": "#eb6834", "VR": "#2a78d6", "Alpha": "#1baf7a"}
+    fig, axes = plt.subplots(len(VAL_TARGETS), 3, figsize=(15, 3.6 * len(VAL_TARGETS)), squeeze=False)
+    for row, tgt in zip(axes, VAL_TARGETS):
+        v = val[val["Target"] == tgt]
+        ax = row[0]
+        for f in ["Cap_mean"] + feats:
+            s = v[v["Feature"] == f]
+            ax.plot(s["Window_s"], s["Spearman_pooled"].abs(), "o-", color=colors[f],
+                    label=f + (" (trial-zeroed)" if f == "Cap_mean" else ""))
+        ax.set_title(f"|Spearman| with {tgt}", fontsize=10, fontweight="bold")
+        ax.set_ylim(0, 1)
+        ax = row[1]
+        for f in feats:
+            s = v[v["Feature"] == f]
+            ax.plot(s["Window_s"], s["Partial_rho_given_Cap"], "o-", color=colors[f], label=f)
+        ax.axhline(0, color="#52514e", lw=0.8)
+        ax.set_title("Partial rho, capacitance mean + std removed", fontsize=10, fontweight="bold")
+        ax = row[2]
+        s = v.drop_duplicates("Window_s")
+        x = np.arange(len(s))
+        ax.bar(x - 0.2, s["LOTO_R2_capacitance"], 0.4, color="#b8b7b2", label="capacitance (trial-zeroed) mean + std")
+        ax.bar(x + 0.2, s["LOTO_R2_capacitance+TDA"], 0.4, color="#eb6834", label="+ TDA features")
+        ax.set_xticks(x, [f"{w:g}" for w in s["Window_s"]])
+        ax.set_title("Leave-one-trial-out R2", fontsize=10, fontweight="bold")
+        ax.set_ylim(min(0, s[["LOTO_R2_capacitance", "LOTO_R2_capacitance+TDA"]].min().min()), 1)
+        for ax in row:
+            ax.set_xlabel("Window length (s)")
+            ax.grid(color="#e4e3df", lw=0.6)
+            ax.spines[["top", "right"]].set_visible(False)
+            ax.legend(frameon=False, fontsize=8)
+    fig.suptitle("Validation: non-overlapping short windows, pooled over the reliable trials",
+                 fontweight="bold")
+    fig.tight_layout()
+    png = os.path.join(out_dir, "SEC_MTS_validation.png")
+    fig.savefig(png, dpi=150)
+    print(f"Saved: {png}")
+    plt.show()
+
+
+# ============================================================
 # RUN
 # ============================================================
 
@@ -805,5 +968,8 @@ overview = pd.DataFrame(results)
 print(f"\n=== All trials ({time.time() - t_start:.0f} s) - setting {profile_name(w, d, dt)}, "
       f"target {best_key} ===")
 print(overview.round(3).to_string(index=False))
+validation = validate(trials, out_dir) if VALIDATE else None
 save_workbook(os.path.join(out_dir, "All_Trials_SEC_MTS_Summary.xlsx"),
-              {"Trials": overview, "Tuning_Summary": summary})
+              {"Trials": overview, "Tuning_Summary": summary,
+               "Validation": validation[0] if validation else None,
+               "Validation_Windows": validation[1] if validation else None})
