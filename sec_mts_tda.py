@@ -739,9 +739,9 @@ def partial_spearman(x, y, controls):
 
 
 def circular_perm_p(groups, n_perm, seed=0):
-    groups = [(x, y) for x, y in groups if len(x) >= 3]
     """p-value of the pooled |Spearman| when the target of each trial is circularly shifted by a
     random amount: keeps the autocorrelation of both series, breaks their alignment."""
+    groups = [(x, y) for x, y in groups if len(x) >= 3]
     rng = np.random.default_rng(seed)
     obs = abs(spearman(np.concatenate([g[0] for g in groups]), np.concatenate([g[1] for g in groups])))
     hits = 0
