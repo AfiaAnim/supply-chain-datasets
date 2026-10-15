@@ -84,9 +84,10 @@ DETREND_OPTIONS = [False, True]         # fine-tuning also tries removing each w
                                         # (the slow capacitance drift can stop the ellipse fit)
 MAX_DELAY_FRACTION = 0.25               # skip settings whose delay > this fraction of the window
 RESOLUTION_WEIGHT = 1.0                 # weight of "shorter window" in the score (0 = ignore)
-MIN_CYCLES_PER_WINDOW = 1.0             # a window must hold at least this many cycles of the
-                                        # dominant oscillation (else the TDA loop is only a partial
-                                        # arc); 0 = no limit. Dominant frequency is found per trial.
+MIN_CYCLES_PER_WINDOW = 0               # a window must hold at least this many cycles of the
+                                        # dominant oscillation; 0 = no limit. Only use (e.g. 1.0) for
+                                        # signals with one clear periodic oscillation - the capacitance
+                                        # trials are broadband, so the guard forced 4 s windows there.
 F_DOM_MIN_HZ = 0.3                      # dominant oscillation is searched above this frequency
 TUNE_FROM_FIRST_FIT_OK = True           # score only from where FastTDA_FitOK first turns True
 FIT_OK_RUN_S = 1.0                      # ... and stays True this long (skips the start-up)
