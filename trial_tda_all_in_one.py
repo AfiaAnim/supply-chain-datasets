@@ -70,10 +70,10 @@ LABEL_NAME = "Capacitance_pF"           # its name in the sheet (e.g. "CartLocat
 LOWPASS_HZ = None                       # extra low-pass in Hz (None = none; must be < fs/2)
 FILTER_ORDER = 5
 
-MODE = "auto"                           # "auto" = fine-tune first; "fixed" = use FIXED_* below
-FIXED_WINDOW = 159                      # samples (used when MODE = "fixed")
-FIXED_DELAY = 8                         # samples
-FIXED_DETREND = False                   # remove each window's linear trend (used when MODE = "fixed")
+MODE = "fixed"                          # "auto" = fine-tune first; "fixed" = use FIXED_* below
+FIXED_WINDOW = 79                       # samples (used when MODE = "fixed"): W79_T8_DT = 0.89 s window,
+FIXED_DELAY = 8                         # 0.09 s delay, detrend on - best common setting of the 3 trials
+FIXED_DETREND = True                    # remove each window's linear trend (used when MODE = "fixed")
 
 # Fine-tuning grid (seconds) and refine multipliers
 WINDOW_S = [1.0, 1.5, 2.0, 2.5, 3.0, 4.0]
@@ -109,6 +109,12 @@ SMOOTH_S = 0.25                         # rolling-median length (0 = off)
 CLEAN_FEATURES = ["VR", "Alpha", "FastTDA"]
 
 NOTE = ""                               # free text for the Metadata sheet
+
+# Capacitance dips: shaded on every panel of the profile plot, and listed per trial, to check
+# that the VR / Alpha / FastTDA jumps line up with them
+SHOW_DIPS = True
+DIP_MADS = 4.0                          # dip = capacitance below its 2 s rolling median by this many robust std
+DIP_MIN_GAP_S = 0.5                     # dips closer than this are merged into one event
 
 
 # ============================================================
@@ -401,6 +407,24 @@ def clean_profile(df, t_end, fs):
     return pd.DataFrame(out)
 
 
+def find_dips(t, x, fs):
+    """Sharp capacitance dips: (start, end) times where x drops far below its local median."""
+    k = max(3, int(round(2 * fs)) | 1)
+    base = pd.Series(x).rolling(k, center=True, min_periods=1).median().to_numpy()
+    r = x - base
+    mad = 1.4826 * np.median(np.abs(r - np.median(r)))
+    low = r < -DIP_MADS * mad if mad > 0 else np.zeros(len(x), bool)
+    edges = np.flatnonzero(np.diff(np.r_[0, low.astype(int), 0]))
+    events = []
+    for a, b in zip(edges[::2], edges[1::2]):
+        t0, t1 = t[a], t[b - 1]
+        if events and t0 - events[-1][1] < DIP_MIN_GAP_S:
+            events[-1] = (events[-1][0], t1, min(events[-1][2], float(r[a:b].min())))
+        else:
+            events.append((t0, t1, float(r[a:b].min())))
+    return events
+
+
 # ============================================================
 # FIGURES
 # ============================================================
@@ -439,7 +463,7 @@ def plot_tuning(summary, dataset, out_dir):
     plt.show()
 
 
-def plot_profile(df, cdf, meta, dataset, out_dir):
+def plot_profile(df, cdf, meta, dataset, out_dir, dips=()):
     cols = [LABEL_NAME, "VR", "Alpha", "FastTDA"]
     colors = ["#52514e", "#2a78d6", "#1baf7a", "#eb6834"]
     fig, axes = plt.subplots(len(cols), 1, figsize=(11, 8), sharex=True)
@@ -455,14 +479,19 @@ def plot_profile(df, cdf, meta, dataset, out_dir):
             bad = df[~df["FastTDA_FitOK"].astype(bool)]
             ax.plot(bad["Time"], np.full(len(bad), ax.get_ylim()[0]), "|", color="#e34948", ms=8,
                     label=f"invalid fit ({len(bad)})")
-        ax.legend(loc="upper right", frameon=False, fontsize=8, ncol=3)
+        for i, (d0, d1, _) in enumerate(dips):
+            ax.axvspan(d0 - 0.1, d1 + 0.1, color="#eda100", alpha=0.25, lw=0,
+                       label="capacitance dip" if i == 0 else None)
+        ax.legend(loc="upper right", frameon=False, fontsize=8, ncol=4)
         ax.set_ylabel(col)
         ax.grid(color="#e4e3df", lw=0.6)
         ax.spines[["top", "right"]].set_visible(False)
     axes[-1].set_xlabel(f"Time (s), window {TIME_LABEL}")
+    dt_txt = ", detrended" if meta.get("Detrend") else ""
+    dip_txt = f", {len(dips)} capacitance dips shaded" if len(dips) else ""
     fig.suptitle(f"{dataset} {meta['Profile']}: window {meta['Window_Size']} "
                  f"({meta['Window_Size'] / meta['Sampling_Hz']:.2f} s), delay {meta['Takens_Delay']} "
-                 f"({meta['Takens_Delay'] / meta['Sampling_Hz']:.3f} s)", fontweight="bold")
+                 f"({meta['Takens_Delay'] / meta['Sampling_Hz']:.3f} s){dt_txt}{dip_txt}", fontweight="bold")
     fig.tight_layout()
     png = os.path.join(out_dir, f"{dataset}_{meta['Profile']}_profile.png")
     fig.savefig(png, dpi=150)
@@ -565,9 +594,26 @@ def process_trial(tr, window, delay, detrend, summary, detail, note):
             stats[f"{col}_smooth_std"] = cdf[f"{col}_smooth"].std()
     print("    Raw vs clean vs smooth:")
     print(pd.DataFrame(rows).round(4).to_string(index=False))
+    dips = []
+    if SHOW_DIPS:
+        dips = find_dips(tr["t"], tr["x"], fs)
+        stats["Capacitance_Dips"] = len(dips)
+        if dips:
+            # how strongly each feature responds at the dips: mean of _smooth within +-1 s of a dip
+            # divided by its mean elsewhere (> 1 = the feature rises at dips)
+            near = np.zeros(len(cdf), bool)
+            for d0, d1, _ in dips:
+                near |= (cdf["Time"] >= d0 - 1.0) & (cdf["Time"] <= d1 + 1.0)
+            print(f"    Capacitance dips ({len(dips)}): "
+                  + ", ".join(f"{d0:.1f}-{d1:.1f} s" for d0, d1, _ in dips))
+            for col in CLEAN_FEATURES:
+                if f"{col}_smooth" in cdf and near.any() and (~near).any():
+                    ratio = cdf.loc[near, f"{col}_smooth"].mean() / cdf.loc[~near, f"{col}_smooth"].mean()
+                    stats[f"{col}_at_dips_ratio"] = ratio
+                    print(f"    {col:8s} at dips / elsewhere: {ratio:.2f}")
     if TUNE_MODE == "per_trial" and summary is not None:
         plot_tuning(summary, tr["name"], tr["out_dir"])
-    plot_profile(df, cdf, meta, tr["name"], tr["out_dir"])
+    plot_profile(df, cdf, meta, tr["name"], tr["out_dir"], dips)
     return stats
 
 
