@@ -76,9 +76,13 @@ OFFSET_GUESS_S = 10.0                   # "the two correspond from about 10 s of
 OFFSET_SEARCH_S = 5.0                   # search the offset within guess +- this (0 = use the guess)
 OFFSET_REF_COL = "Displacement_m"       # MTS column cross-correlated with SEC to find the offset
 MIN_OFFSET_CORR = 0.2                   # below this |correlation| the guess is used instead
+GOOD_OFFSET_CORR = 0.7                  # offsets with a weaker |correlation| (or on the edge of the
+                                        # search range) are flagged as unreliable in the summary
 
-MODE = "auto"                           # "auto" = fine-tune; "fixed" = use FIXED_* below
-FIXED_WINDOW, FIXED_DELAY, FIXED_DETREND = 79, 8, True
+MODE = "fixed"                          # "auto" = fine-tune (~3 min); "fixed" = use FIXED_* below
+# Result of the auto-tuning on trials 04-07: W768_T125 = 38.4 s window (~1 loading cycle),
+# 6.25 s delay, no detrend; 0 failed fits; FastTDA vs window-mean displacement rho +0.84..+0.89
+FIXED_WINDOW, FIXED_DELAY, FIXED_DETREND = 768, 125, False      # samples at RESAMPLE_HZ = 20
 
 # Fine-tuning grid (seconds) and refine multipliers
 WINDOW_S = [2.0, 4.0, 8.0, 12.0, 16.0, 24.0, 32.0, 40.0]       # up to one 40 s loading cycle
@@ -313,11 +317,14 @@ def load_pair(name, num, sec_path, mts_path):
     keep = (t_sec >= offset) & (t_sec <= offset + t_mts[-1])        # overlap only
     t_al = t_sec[keep] - offset                                     # aligned = MTS time
     targets = {c: np.interp(t_al, t_mts, mts[c].to_numpy(float)) for c in TARGET_COLS}
+    on_edge = OFFSET_SEARCH_S and abs(abs(offset - OFFSET_GUESS_S) - OFFSET_SEARCH_S) < 0.11
+    reliable = bool(np.isfinite(r) and r >= GOOD_OFFSET_CORR and not on_edge)
     print(f"  {name}: SEC {t_sec[-1]:.1f} s ({fs:.0f} Hz used), MTS {t_mts[-1]:.1f} s | offset {offset:.2f} s"
           + (f" (|corr| {r:.2f})" if np.isfinite(r) else "")
-          + f" | kept SEC {offset:.1f}-{offset + t_mts[-1]:.1f} s ({keep.sum()} samples)")
+          + f" | kept SEC {offset:.1f}-{offset + t_mts[-1]:.1f} s ({keep.sum()} samples)"
+          + ("" if reliable else "  <-- alignment UNRELIABLE"))
     return {"name": name, "num": num, "t": t_al, "x": x[keep], "fs": fs, "targets": targets,
-            "offset": offset, "offset_corr": r, "mts_t": t_mts, "mts": mts}
+            "offset": offset, "offset_corr": r, "offset_ok": reliable, "mts_t": t_mts, "mts": mts}
 
 
 # ============================================================
@@ -635,7 +642,7 @@ def process_trial(tr, window, delay, detrend, best_key, summary, note, out_dir):
             "Target": best_key}
     stats = {"Trial": tr["name"], "Setup": "updated" if tr["num"] >= TUNE_FROM_TRIAL else "previous",
              "Profile": profile_name(window, delay, detrend), "Offset_s": round(tr["offset"], 3),
-             "Offset_Corr": tr["offset_corr"], "Windows": len(df),
+             "Offset_Corr": tr["offset_corr"], "Alignment_OK": tr["offset_ok"], "Windows": len(df),
              "Invalid_pct": round(100 * n_bad / len(df), 3)}
     rhos = {}
     print(f"    {len(df)} windows, {n_bad} invalid FastTDA fits ({100 * n_bad / len(df):.2f}%)")
@@ -676,7 +683,7 @@ tune_trials = [tr for tr in trials if tr["num"] >= TUNE_FROM_TRIAL] or trials
 summary = None
 if MODE == "fixed":
     w, d, dt = int(FIXED_WINDOW), int(FIXED_DELAY), bool(FIXED_DETREND)
-    best_key = TUNE_TARGET if TUNE_TARGET != "auto" else f"{TARGET_COLS[0]}:std"
+    best_key = TUNE_TARGET if TUNE_TARGET != "auto" else f"{TARGET_COLS[0]}:mean"
     note = "fixed setting"
 else:
     summary = fine_tune(tune_trials)
