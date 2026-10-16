@@ -1,34 +1,29 @@
 """
-SEC + MTS TDA pipeline. Paste into ONE Jupyter cell (or: python sec_mts_tda.py).
+SEC + MTS TDA pipeline (FastTDA). Paste into ONE Jupyter cell and run (or: python sec_mts_tda.py).
 
-SEC  (data/processed/sec/trial_XX*.csv): time_s, C1_raw_pF, C1_clean_pF, C1_filtered_pF, dC1_pF
-MTS  (data/processed/mts/trial_XX*.csv): RunningTime_s, Displacement_raw_m, Displacement_m,
-                                          Force_raw_N, Force_N
-The MTS measurement is the TARGET: the TDA features of the SEC signal are judged by how well
-they follow the MTS displacement / force.
+SEC  (trial_XX*.csv): time_s, C1_raw_pF, C1_clean_pF, C1_filtered_pF, dC1_pF
+MTS  (trial_XX*.csv): RunningTime_s, Displacement_raw_m, Displacement_m, Force_raw_N, Force_N
+Files may sit together in DATA_DIR (or in sec/ and mts/ subfolders); each one is recognised by its
+columns and paired by trial number. The MTS measurement is the TARGET.
 
-    1. Pair SEC and MTS files by trial name (trial_04 <-> trial_04).
-    2. Time-align: SEC time is re-zeroed, then the SEC-MTS offset (about 10 s: MTS time =
-       SEC time - offset) is refined by cross-correlation. Only the overlap is kept
-       (about SEC 10-170 s), so the first ~10 s and last ~30 s of SEC are dropped.
-    3. For every window, the target is the MTS displacement / force over the SAME window:
-       its mean (level) and std (cyclic amplitude).
-    4. Fine-tune window, delay and per-window detrending with FastTDA on the trials from
-       TUNE_FROM_TRIAL onward (the updated setup). Score = failed fits, spikes, roughness,
-       window length AND |Spearman correlation| with the target (weight TARGET_WEIGHT).
-    5. Extract VR / Alpha / FastTDA with the chosen setting for every trial, clean + smooth,
-       report the correlation of each feature with each target, save and plot.
+    1. Pair SEC and MTS files, time-align them (cross-correlation, offset ~10 s), resample to 20 Hz.
+    2. FastTDA profile per trial (fixed W768_T125, or MODE = "auto" fine-tuning): clean, smooth,
+       correlate with the MTS displacement / force, plot profile, scatter and embedded point clouds
+       with the fitted ellipse.
+    3. Fourier analysis per trial: FFT spectrum and dominant peak of SEC, MTS and FastTDA.
+    4. Validation on the reliably aligned trials: short non-overlapping windows, permutation test,
+       partial correlation, leave-one-trial-out models (capacitance / + FastTDA / + direction /
+       + direction + FastTDA) and loading-vs-unloading classification.
 
-Output (in OUTPUT_DIR):
-    <trial>_SEC_MTS_TDA.xlsx   W<window> (9 parity columns, target = MTS at the window midpoint),
-                               Targets (window mean / std of displacement and force),
-                               <W>_Cleaned, Metadata, Tuning_Summary
-    All_Trials_SEC_MTS_Summary.xlsx   offsets, failed fits, feature-target correlations per trial
-    <trial>_SEC_MTS_profile.png, <trial>_SEC_MTS_scatter.png, <trial>_SEC_MTS_ellipses.png,
-    SEC_MTS_tuning.png
+Output (in DATA_DIR/tda_results):
+    <trial>_SEC_MTS_TDA.xlsx, <trial>_SEC_MTS_profile.png, _scatter.png, _ellipses.png, _FFT.png
+    SEC_MTS_FastTDA_validation.png
+    All_Trials_SEC_MTS_Summary.xlsx  (Trials incl. FFT peaks, Validation_R2, Validation_FastTDA,
+                                      Validation_Branch, Validation_Windows)
 
 Requirements:
-    pip install numpy pandas scipy matplotlib openpyxl giotto-tda gudhi
+    pip install numpy pandas scipy matplotlib openpyxl
+    (+ giotto-tda gudhi only if FASTTDA_ONLY = False)
 """
 
 import glob
