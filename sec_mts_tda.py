@@ -7,7 +7,8 @@ Files may sit together in DATA_DIR (or in sec/ and mts/ subfolders); each one is
 columns and paired by trial number. The MTS measurement is the TARGET.
 
     1. Pair SEC and MTS files, time-align them (cross-correlation, offset ~10 s), resample to 20 Hz.
-    2. FastTDA profile per trial (fixed W768_T125, or MODE = "auto" fine-tuning): clean, smooth,
+    2. FastTDA profile per trial (window from the dominant FFT period, MODE = "fft"; or "auto" /
+       "fixed"), with a scan of window lengths around that period: clean, smooth,
        correlate with the MTS displacement / force, plot profile, scatter and embedded point clouds
        with the fitted ellipse.
     3. Fourier analysis per trial: FFT spectrum and dominant peak of SEC, MTS and FastTDA.
@@ -77,10 +78,18 @@ MIN_OFFSET_CORR = 0.2                   # below this |correlation| the guess is 
 GOOD_OFFSET_CORR = 0.7                  # offsets with a weaker |correlation| (or on the edge of the
                                         # search range) are flagged as unreliable in the summary
 
-MODE = "fixed"                          # "auto" = fine-tune (~3 min); "fixed" = use FIXED_* below
+MODE = "fft"                            # "fft"   = window / delay from the dominant FFT period of SEC
+                                        # "auto"  = grid fine-tuning (~3 min)
+                                        # "fixed" = use FIXED_* below
 # Result of the auto-tuning on trials 04-07: W768_T125 = 38.4 s window (~1 loading cycle),
 # 6.25 s delay, no detrend; 0 failed fits; FastTDA vs window-mean displacement rho +0.84..+0.89
 FIXED_WINDOW, FIXED_DELAY, FIXED_DETREND = 768, 125, False      # samples at RESAMPLE_HZ = 20
+
+# MODE = "fft": window = FFT_WINDOW_CYCLES x dominant period, delay = FFT_DELAY_FRACTION x period
+# (a quarter period turns one cycle of a periodic signal into the roundest loop)
+FFT_WINDOW_CYCLES = 1.0
+FFT_DELAY_FRACTION = 0.25
+FFT_WINDOW_SCAN = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0]   # window lengths (x period) compared in a plot
 
 # Fine-tuning grid (seconds) and refine multipliers
 WINDOW_S = [2.0, 4.0, 8.0, 12.0, 16.0, 24.0, 32.0, 40.0]       # up to one 40 s loading cycle
@@ -831,6 +840,77 @@ def fft_analysis(tr, df, cdf, out_dir):
     return out
 
 
+def dominant_period(trials):
+    """Dominant FFT period of the SEC signal: median over the reliably aligned (periodic) trials."""
+    use = [tr for tr in trials if tr["offset_ok"]] or trials
+    rows = []
+    for tr in use:
+        f, amp = fft_spectrum(tr["x"], tr["fs"])
+        peaks = fft_peaks(f, amp, tr["t"][-1] - tr["t"][0])
+        ok = bool(peaks) and peaks[0][2] >= FFT_MIN_POWER_PCT
+        rows.append({"Trial": tr["name"], "Period_s": 1 / peaks[0][0] if ok else np.nan,
+                     "Peak_power_pct": peaks[0][2] if peaks else np.nan})
+    tab = pd.DataFrame(rows)
+    print("\nDominant SEC period per trial (FFT):")
+    print(tab.round(2).to_string(index=False))
+    if tab["Period_s"].notna().sum() == 0:
+        raise RuntimeError("No trial has a dominant periodic FFT peak - use MODE = 'fixed' or 'auto'.")
+    return float(tab["Period_s"].median()), tab
+
+
+def window_scan(trials, period, out_dir):
+    """FastTDA quality and target correlation for windows of FFT_WINDOW_SCAN x the dominant period."""
+    use = [tr for tr in trials if tr["offset_ok"]] or trials
+    fs = use[0]["fs"]
+    rows = []
+    for m in FFT_WINDOW_SCAN:
+        w = int(round(m * period * fs))
+        d = max(1, int(round(min(FFT_DELAY_FRACTION * period * fs, MAX_DELAY_FRACTION * w))))
+        if any(w > len(tr["x"]) for tr in use):
+            continue
+        per = pd.DataFrame([score_setting(tr, w, d, False) for tr in use])
+        row = {"Cycles": m, "Window_s": w / fs, "Delay_s": d / fs, "Window_Size": w, "Takens_Delay": d,
+               "Invalid_pct": per["Invalid_pct"].mean(), "Roughness": per["Roughness"].mean()}
+        for k in target_keys():
+            row[f"|rho| {k}"] = per[f"rho_{k}"].abs().mean()
+        for c in TARGET_COLS:                 # how much of the target's variation survives the averaging
+            row[f"{c}:mean variation left (%)"] = 100 * np.mean(
+                [window_stats(tr["targets"][c], w, TUNE_STEP)[0].std() / tr["targets"][c].std() for tr in use])
+        rows.append(row)
+    scan = pd.DataFrame(rows)
+    print(f"\nWindow scan around the dominant period ({period:.1f} s), mean over "
+          f"{', '.join(tr['name'] for tr in use)}:")
+    print(scan.round(3).to_string(index=False))
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 4))
+    for k, colr in zip([f"{c}:mean" for c in TARGET_COLS], ["#6250d6", "#e87ba4"]):
+        ax1.plot(scan["Window_s"], scan[f"|rho| {k}"], "o-", color=colr, label=f"|Spearman| FastTDA vs {k}")
+    ax1.plot(scan["Window_s"], scan[f"{TARGET_COLS[0]}:mean variation left (%)"] / 100, ":",
+             color="#52514e", lw=1.5, label=f"{TARGET_COLS[0]}:mean variation left (fraction)")
+    ax1.set_ylim(0, 1)
+    ax1.set_ylabel("|Spearman|  /  fraction")
+    ax2.plot(scan["Window_s"], scan["Invalid_pct"], "o-", color="#eb6834", label="failed FastTDA fits (%)")
+    ax2.set_ylabel("Failed fits (%)")
+    for ax in (ax1, ax2):
+        for m in range(1, int(max(FFT_WINDOW_SCAN)) + 1):
+            ax.axvline(m * period, color="#c0392b", lw=1, ls="--")
+        ax.axvline(FFT_WINDOW_CYCLES * period, color="#c0392b", lw=2.5, alpha=0.4,
+                   label=f"chosen: {FFT_WINDOW_CYCLES:g} x {period:.1f} s")
+        ax.set_xlabel("Window length (s)   - dashed = multiples of the dominant period")
+        ax.grid(color="#e4e3df", lw=0.6)
+        ax.spines[["top", "right"]].set_visible(False)
+        ax.legend(frameon=False, fontsize=8)
+    fig.suptitle(f"Window length vs dominant FFT period ({period:.1f} s = {1 / period:.4f} Hz)",
+                 fontweight="bold")
+    fig.tight_layout()
+    png = os.path.join(out_dir, "SEC_MTS_window_vs_period.png")
+    fig.savefig(png, dpi=150)
+    print(f"Saved: {png}")
+    plt.show()
+    plt.close(fig)
+    return scan
+
+
 # ============================================================
 # 4) FASTTDA VALIDATION: short non-overlapping windows, permutation test, partial correlation,
 #    leave-one-trial-out models with and without FastTDA and signal direction
@@ -1091,7 +1171,20 @@ trials = [load_pair(*p) for p in find_pairs()]
 tune_trials = [tr for tr in trials if tr["num"] >= TUNE_FROM_TRIAL] or trials
 
 summary = None
-if MODE == "fixed":
+if MODE == "fft":
+    period, period_tab = dominant_period(trials)
+    fs0 = trials[0]["fs"]
+    w = int(round(FFT_WINDOW_CYCLES * period * fs0))
+    d = max(1, int(round(FFT_DELAY_FRACTION * period * fs0)))
+    dt = False
+    best_key = TUNE_TARGET if TUNE_TARGET != "auto" else f"{TARGET_COLS[0]}:mean"
+    scan = window_scan(trials, period, out_dir)
+    summary = scan
+    note = (f"window = {FFT_WINDOW_CYCLES:g} x dominant FFT period {period:.2f} s, "
+            f"delay = {FFT_DELAY_FRACTION:g} x period")
+    print(f"\nDominant period {period:.2f} s -> window {w} samples ({w / fs0:.1f} s), "
+          f"delay {d} samples ({d / fs0:.2f} s)")
+elif MODE == "fixed":
     w, d, dt = int(FIXED_WINDOW), int(FIXED_DELAY), bool(FIXED_DETREND)
     best_key = TUNE_TARGET if TUNE_TARGET != "auto" else f"{TARGET_COLS[0]}:mean"
     note = "fixed setting"
