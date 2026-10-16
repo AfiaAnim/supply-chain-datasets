@@ -129,6 +129,16 @@ ELLIPSE_TIMES = None                    # None = ELLIPSE_N windows spread over t
                                         # or window-midpoint times in s (MTS clock), e.g. [20, 60, 100]
 ELLIPSE_N = 6
 
+# Fourier transform: amplitude spectrum and dominant peak of each signal (per trial)
+FFT_ANALYSIS = True
+FFT_MIN_HZ = 0.01                       # ignore slower components (drift; period > 100 s)
+FFT_MAX_HZ = 0.5                        # x-axis limit of the spectrum plots
+FFT_PAD = 8                             # zero-padding factor (finer frequency grid for the peak)
+FFT_N_PEAKS = 3                         # peaks listed per signal (dominant + next strongest)
+FFT_MIN_CYCLES = 2.0                    # a period must fit at least this many times into the record
+FFT_MIN_POWER_PCT = 30.0                # dominant peak must hold >= this % of the spectral power,
+                                        # otherwise the signal is reported as "not periodic"
+
 # FastTDA validation: short, non-overlapping windows (several per 40 s loading cycle), so every
 # window is an (almost) independent data point. Leave-one-trial-out models compare
 #   capacitance  |  + FastTDA  |  + direction (capacitance slope)  |  + direction + FastTDA
@@ -734,6 +744,98 @@ def plot_ellipses(tr, df, tg, window, delay, detrend, best_key, out_dir):
     plt.close(fig)
 
 
+def fft_spectrum(y, fs):
+    """One-sided amplitude spectrum of a detrended, Hann-windowed series (zero-padded)."""
+    y = np.asarray(y, float)
+    t = np.arange(len(y))
+    good = np.isfinite(y)
+    y = np.interp(t, t[good], y[good])                       # fill gaps (e.g. FastTDA failed fits)
+    y = signal.detrend(y)                                     # remove offset + linear drift
+    win = np.hanning(len(y))
+    n = int(2 ** np.ceil(np.log2(len(y) * FFT_PAD)))
+    amp = 2 * np.abs(np.fft.rfft(y * win, n)) / win.sum()     # amplitude in signal units
+    return np.fft.rfftfreq(n, 1 / fs), amp
+
+
+def fft_peaks(f, amp, record_s):
+    """Strongest local maxima between max(FFT_MIN_HZ, FFT_MIN_CYCLES / record) and Nyquist, with the
+    share of spectral power (in that band) that lies within +-1 raw frequency bin of each peak."""
+    m = f >= max(FFT_MIN_HZ, FFT_MIN_CYCLES / record_s)
+    fm, am = f[m], amp[m]
+    pk, _ = signal.find_peaks(am, distance=max(1, int(2 * FFT_PAD)))
+    pk = pk[np.argsort(am[pk])[::-1][:FFT_N_PEAKS]]
+    total = np.sum(am ** 2)
+    out = []
+    for i in pk:
+        near = slice(max(0, i - FFT_PAD), i + FFT_PAD + 1)       # +-1 raw bin
+        out.append((float(fm[i]), float(am[i]), float(100 * np.sum(am[near] ** 2) / total)))
+    return out
+
+
+def fft_analysis(tr, df, cdf, out_dir):
+    """Time series and FFT spectrum of SEC, MTS targets and FastTDA, with the dominant peak marked."""
+    series = [(f"SEC {SEC_COL}", tr["t"], tr["x"], tr["fs"], "#52514e")]
+    for c, colr in zip(TARGET_COLS, ["#6250d6", "#e87ba4"]):
+        series.append((f"MTS {c}", tr["t"], tr["targets"][c], tr["fs"], colr))
+    for col in TDA_FEATURES:
+        if f"{col}_smooth" in cdf and np.isfinite(cdf[f"{col}_smooth"]).sum() > 20:
+            y = cdf[f"{col}_smooth"].to_numpy(float)
+            ok = np.flatnonzero(np.isfinite(y))
+            sl = slice(ok[0], ok[-1] + 1)                     # drop the NaN start/end of the profile
+            series.append((f"{col}_smooth", df["Time"].to_numpy(float)[sl], y[sl],
+                           tr["fs"] / WINDOW_STEP, FEATURE_COLORS[col]))
+    fig, axes = plt.subplots(len(series), 2, figsize=(14, 2.3 * len(series)),
+                             gridspec_kw={"width_ratios": [1.6, 1]}, squeeze=False)
+    out = {}
+    for (name, t, y, fs, colr), (ax_t, ax_f) in zip(series, axes):
+        f, amp = fft_spectrum(y, fs)
+        peaks = fft_peaks(f, amp, t[-1] - t[0])
+        ax_t.plot(t, y, color=colr, lw=0.8)
+        ax_t.set_ylabel(name, fontsize=8)
+        ax_f.plot(f, amp, color=colr, lw=1.2)
+        ax_f.set_xlim(0, FFT_MAX_HZ)
+        ax_f.axvspan(0, max(FFT_MIN_HZ, FFT_MIN_CYCLES / (t[-1] - t[0])), color="#e4e3df", lw=0)
+        periodic = bool(peaks) and peaks[0][2] >= FFT_MIN_POWER_PCT
+        for k, (pf, pa, pp) in enumerate(peaks):
+            main = k == 0 and periodic
+            ax_f.plot(pf, pa, "o" if main else "^", color="#c0392b" if main else "#0d366b",
+                      ms=7 if main else 5)
+            ax_f.annotate(f"{pf:.4f} Hz, T = {1 / pf:.1f} s ({pp:.0f}% power)" if main else f"{1 / pf:.1f} s",
+                          (pf, pa), xytext=(8, -3), textcoords="offset points",
+                          fontsize=8 if main else 7, fontweight="bold" if main else "normal")
+        ax_f.set_ylim(0, 1.25 * max(amp[f >= FFT_MIN_HZ].max(), 1e-12))
+        ax_t.set_title(f"dominant period {1 / peaks[0][0]:.1f} s" if periodic else
+                       "no dominant periodic peak (not periodic / record too short)",
+                       fontsize=8, loc="right", color="#0b0b0b" if periodic else "#c0392b")
+        key = name.split(" ")[-1]
+        out[f"{key}_peak_Hz"] = peaks[0][0] if periodic else np.nan
+        out[f"{key}_period_s"] = 1 / peaks[0][0] if periodic else np.nan
+        out[f"{key}_peak_amp"] = peaks[0][1] if periodic else np.nan
+        out[f"{key}_peak_power_pct"] = peaks[0][2] if peaks else np.nan
+        out[f"{key}_other_periods_s"] = ", ".join(f"{1 / p[0]:.1f}" for p in peaks[1:]) if periodic else ""
+        for ax in (ax_t, ax_f):
+            ax.grid(color="#e4e3df", lw=0.6)
+            ax.spines[["top", "right"]].set_visible(False)
+    axes[-1, 0].set_xlabel("Time (s), MTS clock")
+    axes[-1, 1].set_xlabel("Frequency (Hz)")
+    fig.suptitle(f"{tr['name']}: Fourier analysis - time series (left) and FFT amplitude spectrum "
+                 f"(right, Hann window, detrended); dominant peak in red, grey band = ignored",
+                 fontweight="bold", fontsize=11)
+    fig.tight_layout()
+    png = os.path.join(out_dir, f"{tr['name']}_SEC_MTS_FFT.png")
+    fig.savefig(png, dpi=150)
+    print(f"Saved: {png}")
+    plt.show()
+    plt.close(fig)
+    sec_p, mts_p = out.get(f"{SEC_COL}_period_s"), out.get(f"{TARGET_COLS[0]}_period_s")
+    print("    FFT dominant periods: " + ", ".join(
+        f"{k[:-9]} {v:.1f} s" if np.isfinite(v) else f"{k[:-9]} not periodic"
+        for k, v in out.items() if k.endswith("_period_s")))
+    if sec_p and mts_p and np.isfinite(sec_p) and np.isfinite(mts_p):
+        out["SEC_matches_MTS"] = bool(abs(sec_p - mts_p) / mts_p < 0.1)
+    return out
+
+
 # ============================================================
 # 4) FASTTDA VALIDATION: short non-overlapping windows, permutation test, partial correlation,
 #    leave-one-trial-out models with and without FastTDA and signal direction
@@ -981,6 +1083,8 @@ def process_trial(tr, window, delay, detrend, best_key, summary, note, out_dir):
     plot_scatter(tr, cdf, tg, best_key, out_dir)
     if PLOT_ELLIPSES:
         plot_ellipses(tr, df, tg, window, delay, detrend, best_key, out_dir)
+    if FFT_ANALYSIS:
+        stats.update(fft_analysis(tr, df, cdf, out_dir))
     return stats
 
 
