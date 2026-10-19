@@ -48,6 +48,9 @@ Usage
     --no-flags                  skip the 0/1 category flags
     --skip a b ...              file stems to leave out (e.g. --skip vsoe vevent)
 
+    In Jupyter, paste the file and call main() with a list instead:
+        main(["--data-dir", "/path/to/CRSS2024", "--out", "crss2024_person.csv"])
+
 Aggregated columns are blank (not 0) where the table has no row for that key,
 e.g. driver-factor tables for a passenger or for a non-motorist with no striking
 vehicle. Post-crash fields (EMS times, hospital, towing) are merged like any
@@ -148,14 +151,15 @@ def merge_checked(base, other, left_on, right_on, name):
     return merged
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--data-dir", default=".", help="folder holding the CRSS CSV files")
     ap.add_argument("--out", default="crss_person_merged.csv", help=".csv, .csv.gz or .parquet")
     ap.add_argument("--labels", choices=["both", "codes", "names"], default="both")
     ap.add_argument("--no-flags", action="store_true")
     ap.add_argument("--skip", nargs="*", default=[], help="file stems to leave out")
-    args = ap.parse_args()
+    # parse_known_args: ignore the extra "-f kernel.json" Jupyter passes
+    args, _ = ap.parse_known_args(argv)
 
     data_dir = Path(args.data_dir)
     files = {p.stem.lower(): p for p in sorted(data_dir.glob("*.csv"))}
@@ -243,5 +247,5 @@ def main():
         print("not merged:", unused)
 
 
-if __name__ == "__main__":
+if __name__ == "__main__" and "ipykernel" not in sys.modules:
     main()
