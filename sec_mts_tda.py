@@ -338,7 +338,12 @@ def find_pairs():
     for p in sorted(files):
         name, num = trial_key(p)
         kind = file_kind(p) if name else None
+        if not name:
+            print(f"  ignored {os.path.basename(p)}: no 'trial_NN' in the file name")
+            continue
         if kind is None:
+            print(f"  ignored {os.path.basename(p)}: columns not recognised as SEC ({SEC_COL}) or "
+                  f"MTS ({MTS_TIME_COL}, {', '.join(TARGET_COLS)})")
             continue
         group = sec if kind == "sec" else mts
         if name in group:
@@ -348,6 +353,8 @@ def find_pairs():
         group[name] = (num, p)
     if not sec:
         raise FileNotFoundError(f"No SEC csv files (with a {SEC_COL!r} column) found in {os.path.abspath(base)}")
+    for name in sorted(set(mts) - set(sec)):
+        print(f"  {name}: MTS file found but no SEC file - skipped")
     pairs = []
     for name in sorted(sec):
         if TRIALS and name not in TRIALS:
