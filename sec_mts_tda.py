@@ -11,14 +11,16 @@ columns and paired by trial number. The MTS measurement is the TARGET.
        "fixed"), with a scan of window lengths around that period: clean, smooth,
        correlate with the MTS displacement / force, plot profile, scatter and embedded point clouds
        with the fitted ellipse.
-    3. Fourier analysis per trial: FFT spectrum and dominant peak of SEC, MTS and FastTDA.
+    3. Fourier analysis per trial: FFT spectrum and dominant peak of SEC, MTS and FastTDA, the
+       signals wound around a circle at the dominant period, and their constituent sinusoids.
     4. Validation on the reliably aligned trials: short non-overlapping windows, permutation test,
        partial correlation, leave-one-trial-out models (capacitance / + FastTDA / + direction /
        + direction + FastTDA) and loading-vs-unloading classification.
 
 Output (in DATA_DIR/tda_results):
-    <trial>_SEC_MTS_TDA.xlsx, <trial>_SEC_MTS_profile.png, _scatter.png, _ellipses.png, _FFT.png
-    SEC_MTS_FastTDA_validation.png
+    <trial>_SEC_MTS_TDA.xlsx, <trial>_SEC_MTS_profile.png, _scatter.png, _ellipses.png, _FFT.png,
+    _FFT_winding.png (signals wound around a circle), _FFT_components.png/.xlsx (constituent sinusoids)
+    SEC_MTS_window_vs_period.png, SEC_MTS_FastTDA_validation.png
     All_Trials_SEC_MTS_Summary.xlsx  (Trials incl. FFT peaks, Validation_R2, Validation_FastTDA,
                                       Validation_Branch, Validation_Windows)
 
@@ -142,6 +144,12 @@ FFT_N_PEAKS = 3                         # peaks listed per signal (dominant + ne
 FFT_MIN_CYCLES = 2.0                    # a period must fit at least this many times into the record
 FFT_MIN_POWER_PCT = 30.0                # dominant peak must hold >= this % of the spectral power,
                                         # otherwise the signal is reported as "not periodic"
+FFT_WINDING = True                      # "winding" plots: each signal wrapped around a circle
+FFT_WINDING_OFF = 0.8                   # extra winding period = this x dominant period (misaligned)
+FFT_COMPONENTS = True                   # each signal and its constituent sinusoids
+FFT_N_COMPONENTS = 6                    # strongest Fourier components drawn per signal
+FFT_COMPONENT_CYCLES = 2                # cycles of the dominant period shown
+COMPONENT_COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6", "#e34948"]
 
 # FastTDA validation: short, non-overlapping windows (several per 40 s loading cycle), so every
 # window is an (almost) independent data point. Leave-one-trial-out models compare
@@ -776,8 +784,8 @@ def fft_peaks(f, amp, record_s):
     return out
 
 
-def fft_analysis(tr, df, cdf, out_dir):
-    """Time series and FFT spectrum of SEC, MTS targets and FastTDA, with the dominant peak marked."""
+def fft_series(tr, df, cdf):
+    """(name, time, values, fs, colour) for SEC, the MTS targets and the smoothed TDA features."""
     series = [(f"SEC {SEC_COL}", tr["t"], tr["x"], tr["fs"], "#52514e")]
     for c, colr in zip(TARGET_COLS, ["#6250d6", "#e87ba4"]):
         series.append((f"MTS {c}", tr["t"], tr["targets"][c], tr["fs"], colr))
@@ -788,6 +796,12 @@ def fft_analysis(tr, df, cdf, out_dir):
             sl = slice(ok[0], ok[-1] + 1)                     # drop the NaN start/end of the profile
             series.append((f"{col}_smooth", df["Time"].to_numpy(float)[sl], y[sl],
                            tr["fs"] / WINDOW_STEP, FEATURE_COLORS[col]))
+    return series
+
+
+def fft_analysis(tr, df, cdf, out_dir):
+    """Time series and FFT spectrum of SEC, MTS targets and FastTDA, with the dominant peak marked."""
+    series = fft_series(tr, df, cdf)
     fig, axes = plt.subplots(len(series), 2, figsize=(14, 2.3 * len(series)),
                              gridspec_kw={"width_ratios": [1.6, 1]}, squeeze=False)
     out = {}
@@ -838,6 +852,100 @@ def fft_analysis(tr, df, cdf, out_dir):
     if sec_p and mts_p and np.isfinite(sec_p) and np.isfinite(mts_p):
         out["SEC_matches_MTS"] = bool(abs(sec_p - mts_p) / mts_p < 0.1)
     return out
+
+
+def plot_fft_winding(tr, df, cdf, period, out_dir):
+    """Each signal wrapped around a circle (angle = 2 pi t / winding period, radius = signal).
+    At the dominant period the loops line up and the centre of mass (black dot) moves away from
+    the centre - its distance is what the Fourier transform measures at that frequency."""
+    series = fft_series(tr, df, cdf)
+    periods = [FFT_WINDING_OFF * period, period]
+    fig, axes = plt.subplots(len(periods), len(series), figsize=(3.4 * len(series), 4.3 * len(periods)),
+                             subplot_kw={"projection": "polar"}, squeeze=False,
+                             gridspec_kw={"hspace": 0.55, "wspace": 0.3})
+    for row, pw in zip(axes, periods):
+        for ax, (name, t, y, fs, colr) in zip(row, series):
+            y = np.asarray(y, float)
+            good = np.isfinite(y)
+            t, y = t[good], y[good]
+            r = 0.15 + 0.85 * (y - y.min()) / (np.ptp(y) or 1.0)        # positive radius 0.15..1
+            th = 2 * np.pi * (t - t[0]) / pw
+            ax.plot(th, r, color=colr, lw=1.1, label=f"{name.split(' ')[-1]}: period of {pw:.2f} s")
+            g = np.mean(r * np.exp(1j * th))                             # centre of mass
+            ax.plot(np.angle(g), np.abs(g), "o", color="#0b0b0b", ms=6, zorder=5)
+            ax.set_ylim(0, 1.05)
+            ax.set_yticklabels([])
+            ax.set_xticklabels([])
+            ax.grid(color="#e4e3df", lw=0.6)
+            ax.spines["polar"].set_color("#e4e3df")
+            ax.legend(loc="upper center", bbox_to_anchor=(0.5, 1.22), frameon=True, fontsize=8,
+                      handlelength=1.5, edgecolor="#e4e3df")
+            ax.text(0.5, -0.08, f"centre of mass |g| = {abs(g):.3f}", transform=ax.transAxes,
+                    ha="center", fontsize=8, color="#52514e")
+    fig.suptitle(f"{tr['name']}: signals wound around a circle - top: {FFT_WINDING_OFF:g} x period "
+                 f"(misaligned), bottom: dominant period {period:.2f} s (loops align, dot moves out)",
+                 fontweight="bold", fontsize=11, y=1.0)
+    fig.subplots_adjust(top=0.9, bottom=0.06)
+    png = os.path.join(out_dir, f"{tr['name']}_SEC_MTS_FFT_winding.png")
+    fig.savefig(png, dpi=150, bbox_inches="tight")
+    print(f"Saved: {png}")
+    plt.show()
+    plt.close(fig)
+
+
+def plot_fft_components(tr, df, cdf, period, out_dir):
+    """Each signal over FFT_COMPONENT_CYCLES cycles with its FFT_N_COMPONENTS strongest Fourier
+    sinusoids and their sum (as in 'square wave and its constituent sinusoids')."""
+    series = fft_series(tr, df, cdf)
+    fig, axes = plt.subplots(len(series), 1, figsize=(12, 2.9 * len(series)), squeeze=False)
+    rows = []
+    for ax, (name, t, y, fs, colr) in zip(axes[:, 0], series):
+        y = np.asarray(y, float)
+        good = np.isfinite(y)
+        y = np.interp(np.arange(len(y)), np.flatnonzero(good), y[good])
+        n_per = int(round(period * fs))
+        n = (len(y) // n_per) * n_per or len(y)                 # whole cycles only: no leakage
+        t, y = t[:n] - t[0], y[:n] - y[:n].mean()
+        c = np.fft.rfft(y) / n
+        k = np.argsort(np.abs(c[1:]))[::-1][:FFT_N_COMPONENTS] + 1
+        show = t <= FFT_COMPONENT_CYCLES * period
+        recon = np.zeros(n)
+        ax.plot(t[show], y[show], color=colr, lw=3.2, label=f"{name} (mean removed)", zorder=3)
+        for kk in sorted(k):
+            comp = 2 * np.abs(c[kk]) * np.cos(2 * np.pi * kk * np.arange(n) / n + np.angle(c[kk]))
+            recon += comp
+            fk = kk * fs / n
+            h = fk * period                                     # harmonic number of the dominant period
+            harmonic = abs(h - round(h)) < 0.05 and round(h) >= 1
+            colored = harmonic and round(h) <= len(COMPONENT_COLORS)
+            ax.plot(t[show], comp[show], lw=1.6,                # colour = harmonic, same in every panel
+                    color=COMPONENT_COLORS[round(h) - 1] if colored else "#b8b7b2",
+                    label=f"{'harmonic ' + str(round(h)) if harmonic else 'non-harmonic'}: "
+                          f"T = {1 / fk:.1f} s, {fk:.4f} Hz, amp {2 * np.abs(c[kk]):.3g}")
+            rows.append({"Trial": tr["name"], "Signal": name, "Freq_Hz": fk, "Period_s": 1 / fk,
+                         "Harmonic_of_dominant": fk * period, "Amplitude": 2 * np.abs(c[kk])})
+        expl = 100 * (1 - np.var(y - recon) / np.var(y))
+        ax.plot(t[show], recon[show], color="#0b0b0b", lw=1.2, ls="--",
+                label=f"sum of {len(k)} sinusoids ({expl:.0f}% of variance)", zorder=4)
+        ax.axhline(0, color="#52514e", lw=0.6)
+        for m in range(1, FFT_COMPONENT_CYCLES):
+            ax.axvline(m * period, color="#b8b7b2", lw=0.8)
+        ax.set_ylabel("Amplitude", fontsize=9)
+        ax.grid(color="#e4e3df", lw=0.6)
+        ax.spines[["top", "right"]].set_visible(False)
+        ax.legend(loc="center left", bbox_to_anchor=(1.01, 0.5), frameon=False, fontsize=7.5)
+        ax.set_title(f"{name} and its constituent sinusoids", fontsize=10, fontweight="bold", loc="left")
+    axes[-1, 0].set_xlabel(f"Time (s) - first {FFT_COMPONENT_CYCLES} cycles of the dominant period "
+                           f"({period:.2f} s)")
+    fig.suptitle(f"{tr['name']}: Fourier decomposition - {FFT_N_COMPONENTS} strongest components",
+                 fontweight="bold")
+    fig.tight_layout()
+    png = os.path.join(out_dir, f"{tr['name']}_SEC_MTS_FFT_components.png")
+    fig.savefig(png, dpi=150, bbox_inches="tight")
+    print(f"Saved: {png}")
+    plt.show()
+    plt.close(fig)
+    return pd.DataFrame(rows)
 
 
 def dominant_period(trials):
@@ -1159,7 +1267,18 @@ def process_trial(tr, window, delay, detrend, best_key, summary, note, out_dir):
     if PLOT_ELLIPSES:
         plot_ellipses(tr, df, tg, window, delay, detrend, best_key, out_dir)
     if FFT_ANALYSIS:
-        stats.update(fft_analysis(tr, df, cdf, out_dir))
+        fft_out = fft_analysis(tr, df, cdf, out_dir)
+        stats.update(fft_out)
+        period = fft_out.get(f"{SEC_COL}_period_s", np.nan)
+        if not np.isfinite(period):
+            print("    No dominant SEC period - winding / component plots skipped for this trial")
+        else:
+            if FFT_WINDING:
+                plot_fft_winding(tr, df, cdf, period, out_dir)
+            if FFT_COMPONENTS:
+                comps = plot_fft_components(tr, df, cdf, period, out_dir)
+                save_workbook(os.path.join(out_dir, f"{tr['name']}_SEC_MTS_FFT_components.xlsx"),
+                              {"Components": comps})
     return stats
 
 
