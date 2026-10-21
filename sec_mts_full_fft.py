@@ -13,7 +13,8 @@ df = 1 / record length (e.g. 160 s -> 0.00625 Hz) and the peaks are exact FFT bi
 Paste into ONE Jupyter cell and run (or: python sec_mts_full_fft.py).
 
 Output (in DATA_DIR/tda_results/full_fft):
-    <trial>_full_fft.png              |fx| vs f for SEC, MTS displacement and MTS force
+    <trial>_full_fft.png              |fx| vs f (0 .. Nyquist, MATLAB style) for SEC, MTS displacement
+                                      and MTS force, with a zoom inset on the dominant peak
     <trial>_full_fft_buildup.gif      the same FFT computed on a growing record (0 -> full length)
     All_trials_full_fft.png           all trials side by side, dominant peaks marked
     Full_FFT_peaks.xlsx               dominant frequency / period and next peaks per file
@@ -58,7 +59,15 @@ REMOVE_MEAN = True                      # True: subtract the mean before the FFT
                                         # not; then the 0 Hz bin (SEC ~45 pF offset) dwarfs every peak
 MATLAB_AXIS = False                     # True: w = linspace(0,1,N/2)/(2*dt) exactly as in MATLAB;
                                         # False: exact bin frequencies k/(N*dt) (differ by < 1 bin)
-F_MAX_PLOT = 0.5                        # x-axis limit in Hz (the loading is 0.025 Hz); None = up to Nyquist
+MATLAB_LOOK = True                      # per-trial plots styled like the MATLAB figure (Times, bold,
+                                        # boxed axes, blue line, full axis 0 .. Nyquist)
+USE_RAW = False                         # True: unfiltered columns (C1_raw_pF, Displacement_raw_m,
+                                        # Force_raw_N) - they keep the high-frequency content
+F_MAX_PLOT = None                       # x-axis limit in Hz; None = up to Nyquist (as in MATLAB)
+LOG_Y = False                           # True: logarithmic |fx| axis - shows the small high-frequency
+                                        # peaks (e.g. 24 / 41 Hz in Force_raw_N) next to the 0.025 Hz one
+ZOOM_HZ = 0.2                           # inset zoom 0 .. ZOOM_HZ on the dominant peak; None = no inset
+F_MAX_OVERVIEW = 0.5                    # x-axis limit of the all-trials overview and the animation
 MIN_PEAK_HZ = 0.01                      # peaks below this (drift) are not reported
 N_PEAKS = 4                             # peaks listed per signal (dominant + next strongest)
 MIN_CYCLES = 3                          # a peak's period must fit this many times into the record
@@ -70,6 +79,8 @@ BUILDUP_FRAMES = 40
 BUILDUP_FPS = 6
 BUILDUP_TRIALS = None                   # None = all trials; or e.g. ["trial_05"]
 
+RAW_COLS = {"SEC": "C1_raw_pF", "Displacement_m": "Displacement_raw_m", "Force_N": "Force_raw_N"}
+MATLAB_BLUE = "#0072BD"
 COLORS = {"SEC": "#52514e", "Displacement_m": "#6250d6", "Force_N": "#e87ba4"}
 UNITS = {"SEC": "pF", "Displacement_m": "m", "Force_N": "N"}
 GRID, INK = "#e4e3df", "#0b0b0b"
@@ -157,10 +168,11 @@ def uniform(t, y):
 def load_trial(name, sec_path, mts_path):
     sec, mts = read_numeric_csv(sec_path), read_numeric_csv(mts_path)
     sigs = {}
-    t, y, dt = uniform(sec[SEC_TIME_COL].to_numpy(float), sec[SEC_COL].to_numpy(float))
+    col = lambda name: RAW_COLS.get(name, name) if USE_RAW else (SEC_COL if name == "SEC" else name)
+    t, y, dt = uniform(sec[SEC_TIME_COL].to_numpy(float), sec[col("SEC")].to_numpy(float))
     sigs["SEC"] = (t, y, dt)
     for c in TARGET_COLS:
-        t, y, dt = uniform(mts[MTS_TIME_COL].to_numpy(float), mts[c].to_numpy(float))
+        t, y, dt = uniform(mts[MTS_TIME_COL].to_numpy(float), mts[col(c)].to_numpy(float))
         sigs[c] = (t, y, dt)
     print(f"  {name}: SEC {sigs['SEC'][0][-1]:.1f} s at {1 / sigs['SEC'][2]:.0f} Hz, "
           f"MTS {sigs[TARGET_COLS[0]][0][-1]:.1f} s at {1 / sigs[TARGET_COLS[0]][2]:.0f} Hz")
@@ -201,9 +213,9 @@ def is_dominant(pk):
     return bool(pk) and pk[0][2] >= MIN_POWER_PCT
 
 
-def visible(w, *arrays):
+def visible(w, *arrays, fmax=None):
     """Only the plotted frequency range (drawing every bin up to Nyquist is slow)."""
-    m = w <= (F_MAX_PLOT or w[-1])
+    m = w <= (fmax or w[-1])
     return (w[m],) + tuple(a[m] for a in arrays)
 
 
@@ -212,45 +224,69 @@ def thin(t, y, n=4000):
     return t[::k], y[::k]
 
 
+MATLAB_RC = {"font.family": "serif",
+             "font.serif": ["Times New Roman", "Times", "Liberation Serif", "Nimbus Roman", "DejaVu Serif"],
+             "font.weight": "bold", "axes.labelweight": "bold", "axes.titleweight": "bold",
+             "font.size": 14, "axes.linewidth": 1.0, "xtick.direction": "in", "ytick.direction": "in",
+             "xtick.top": True, "ytick.right": True, "axes.grid": False}
+
+
 def plot_trial(tr, out_dir):
+    """|fx| vs f of the full record for SEC, MTS displacement and MTS force (MATLAB-style figure)."""
     names = ["SEC"] + TARGET_COLS
-    fig, axes = plt.subplots(len(names), 1, figsize=(11, 2.9 * len(names)), squeeze=False)
     rows = []
-    for ax, name in zip(axes[:, 0], names):
-        t, y, dt = tr["sigs"][name]
-        w, amp = full_fft(y, dt)
-        pk = peaks_of(w, amp, t[-1])
-        dominant = is_dominant(pk)
-        lab = "SEC " + SEC_COL if name == "SEC" else "MTS " + name
-        ax.plot(*visible(w, amp), color=COLORS[name], lw=1.4)
-        for k, (f, a, share) in enumerate(pk):
-            main = k == 0 and dominant
-            if f <= (F_MAX_PLOT or w[-1]):
-                ax.plot(f, a, "o" if main else "^", color="#c0392b" if main else "#0d366b",
-                        ms=8 if main else 6, zorder=5)
-                ax.annotate(f"{f:.4f} Hz  (T = {1 / f:.1f} s, {share:.0f}% power)" if main
-                            else f"{f:.4f} Hz ({1 / f:.1f} s)", (f, a), xytext=(8, 2 if main else 12 * (k % 2) - 4),
-                            textcoords="offset points", fontsize=9 if main else 7.5,
-                            fontweight="bold" if main else "normal", color=INK)
-            rows.append({"Trial": tr["name"], "Signal": name, "Rank": k + 1, "Freq_Hz": f,
-                         "Period_s": 1 / f, "abs_fx": a, "Power_share_pct": share,
-                         "Dominant": main, "Record_s": t[-1], "Resolution_Hz": 1 / (len(t) * dt)})
-        if not dominant:
-            ax.text(0.98, 0.92, "no dominant peak (not periodic)", transform=ax.transAxes, ha="right",
-                    va="top", fontsize=9, color="#c0392b", fontweight="bold")
-        ax.set_xlim(0, F_MAX_PLOT or w[-1])
-        ax.set_ylim(0, 1.2 * max(amp[w >= MIN_PEAK_HZ].max(), 1e-12))
-        ax.set_ylabel(f"|fx|  ({UNITS[name]}·samples)", fontsize=9)
-        ax.set_title(f"{lab}: full record {t[-1]:.1f} s, N = {len(t)}, df = {1 / (len(t) * dt):.5f} Hz",
-                     fontsize=10, fontweight="bold", loc="left")
-        ax.grid(color=GRID, lw=0.6)
-        ax.spines[["top", "right"]].set_visible(False)
-    axes[-1, 0].set_xlabel("f (Hz)")
-    fig.suptitle(f"{tr['name']}: Fourier transform of the full time series (red = dominant peak)",
-                 fontweight="bold")
-    fig.tight_layout()
-    png = os.path.join(out_dir, f"{tr['name']}_full_fft.png")
-    fig.savefig(png, dpi=150)
+    with plt.rc_context(MATLAB_RC if MATLAB_LOOK else {}):
+        fig, axes = plt.subplots(len(names), 1, figsize=(11, 3.6 * len(names)), squeeze=False)
+        for ax, name in zip(axes[:, 0], names):
+            t, y, dt = tr["sigs"][name]
+            w, amp = full_fft(y, dt)
+            pk = peaks_of(w, amp, t[-1])
+            dominant = is_dominant(pk)
+            colr = MATLAB_BLUE if MATLAB_LOOK else COLORS[name]
+            lab = ("SEC " if name == "SEC" else "MTS ") + (RAW_COLS.get(name, name) if USE_RAW else
+                                                          (SEC_COL if name == "SEC" else name))
+            fmax = F_MAX_PLOT or w[-1]
+            ax.plot(*visible(w, amp, fmax=fmax), color=colr, lw=1.0)
+            ax.set_xlim(0, fmax)
+            if LOG_Y:
+                ax.set_yscale("log")
+                ax.set_ylim(np.percentile(amp[1:], 1), 3 * amp[1:].max())
+            else:
+                ax.set_ylim(0, 1.08 * amp[1:].max())
+            ax.set_xlabel("f (Hz)")
+            ax.set_ylabel("|fx|")
+            ax.set_title(f"{tr['name']} - {lab}: full record {t[-1]:.1f} s, N = {len(t)}", fontsize=12)
+            for k, (f, a, share) in enumerate(pk):
+                rows.append({"Trial": tr["name"], "Signal": name, "Rank": k + 1, "Freq_Hz": f,
+                             "Period_s": 1 / f, "abs_fx": a, "Power_share_pct": share,
+                             "Dominant": k == 0 and dominant, "Record_s": t[-1],
+                             "Resolution_Hz": 1 / (len(t) * dt)})
+            if ZOOM_HZ and ZOOM_HZ < fmax:                  # inset: zoom on the slow loading peaks
+                ins = ax.inset_axes([0.42, 0.30, 0.55, 0.62])
+                ins.plot(*visible(w, amp, fmax=ZOOM_HZ), color=colr, lw=1.2)
+                ins.set_xlim(0, ZOOM_HZ)
+                zm = w <= ZOOM_HZ
+                ins.set_ylim(0, 1.25 * amp[zm][1:].max())
+                ins.tick_params(labelsize=10)
+                ins.set_title(f"zoom 0-{ZOOM_HZ:g} Hz", fontsize=10)
+                target = ins
+            else:
+                target = ax
+            for k, (f, a, share) in enumerate(pk):
+                if f > (ZOOM_HZ if target is not ax else fmax):
+                    continue
+                main = k == 0 and dominant
+                target.plot(f, a, "o" if main else "^", color="#D95319" if main else "#7E2F8E",
+                            ms=7 if main else 5, zorder=5)
+                target.annotate(f"{f:.4f} Hz (T = {1 / f:.1f} s)" if main else f"{f:.3f} Hz",
+                                (f, a), xytext=(6, 2 if main else 10 * (k % 2) - 3),
+                                textcoords="offset points", fontsize=9 if main else 8)
+            if not dominant:
+                ax.text(0.98, 0.95, "no dominant peak (not periodic)", transform=ax.transAxes,
+                        ha="right", va="top", fontsize=10, color="#A2142F")
+        fig.tight_layout()
+        png = os.path.join(out_dir, f"{tr['name']}_full_fft.png")
+        fig.savefig(png, dpi=150)
     print(f"Saved: {png}")
     plt.show()
     plt.close(fig)
@@ -274,7 +310,7 @@ def buildup_animation(tr, out_dir):
         line, = ax_f.plot([], [], color=COLORS[name], lw=1.4)
         dot, = ax_f.plot([], [], "o", color="#c0392b", ms=8)
         txt = ax_f.text(0.98, 0.95, "", transform=ax_f.transAxes, ha="right", va="top", fontsize=8.5)
-        ax_f.set_xlim(0, F_MAX_PLOT or w_full[-1])
+        ax_f.set_xlim(0, F_MAX_OVERVIEW or w_full[-1])
         ax_f.set_ylim(0, 1.2 * a_full[w_full >= MIN_PEAK_HZ].max())
         ax_f.set_ylabel("|fx|", fontsize=8)
         for ax in (ax_t, ax_f):
@@ -292,7 +328,7 @@ def buildup_animation(tr, out_dir):
             n = max(8, int(round(fracs[k] * len(t))))
             w, amp = full_fft(y[:n], dt)
             used.set_data(*thin(t[:n], y[:n]))
-            line.set_data(*visible(w, amp))
+            line.set_data(*visible(w, amp, fmax=F_MAX_OVERVIEW))
             pk = peaks_of(w, amp, t[n - 1])
             if is_dominant(pk):
                 dot.set_data([pk[0][0]], [pk[0][1]])
@@ -325,7 +361,7 @@ def plot_all(trials, out_dir):
             ax = axes[i, j]
             t, y, dt = tr["sigs"][name]
             w, amp = full_fft(y, dt)
-            ax.plot(*visible(w, amp), color=COLORS[name], lw=1.1)
+            ax.plot(*visible(w, amp, fmax=F_MAX_OVERVIEW), color=COLORS[name], lw=1.1)
             pk = peaks_of(w, amp, t[-1])
             if is_dominant(pk):
                 f, a, _ = pk[0]
@@ -335,7 +371,7 @@ def plot_all(trials, out_dir):
             else:
                 ax.text(0.98, 0.85, "no dominant peak", transform=ax.transAxes, ha="right", va="top",
                         fontsize=7.5, color="#c0392b")
-            ax.set_xlim(0, F_MAX_PLOT or w[-1])
+            ax.set_xlim(0, F_MAX_OVERVIEW or w[-1])
             ax.set_ylim(0, 1.25 * max(amp[w >= MIN_PEAK_HZ].max(), 1e-12))
             ax.set_yticks([])
             ax.grid(color=GRID, lw=0.5)
