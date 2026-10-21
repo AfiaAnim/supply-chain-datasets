@@ -448,9 +448,11 @@ def plot_map(G, df, loads, flooded, crit_df, school_pt, zones, path, n_detour_la
              ha="center", fontsize=8, color="#444444")
     fig.subplots_adjust(bottom=0.14, top=0.93, left=0.02, right=0.98)
     fig.savefig(path, dpi=200)
-    if "ipykernel" in sys.modules:
-        plt.show()  # also display inline in Jupyter
     plt.close(fig)
+    if "ipykernel" in sys.modules:
+        # show the saved PNG inline; works even if the kernel's matplotlib backend is "Agg"
+        from IPython.display import Image, display
+        display(Image(filename=path, width=900))
 
 
 # --- main --------------------------------------------------------------------------
