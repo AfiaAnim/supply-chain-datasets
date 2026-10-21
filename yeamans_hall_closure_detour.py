@@ -19,7 +19,9 @@ Steps
 Requirements
     pip install osmnx networkx pandas matplotlib
 
-Usage
+Usage (Jupyter: install with  %pip install osmnx networkx pandas matplotlib
+       then  %run yeamans_hall_closure_detour.py --close-segment 2
+       or paste this file into a cell; it calls main() itself)
     python yeamans_hall_closure_detour.py
     python yeamans_hall_closure_detour.py --close-segment 2      # pick a segment by index
     python yeamans_hall_closure_detour.py --list-segments        # show segments and exit
@@ -195,7 +197,8 @@ def fmt_min(s):
     return f"{s / 60:.1f} min"
 
 
-def main():
+def main(argv=None):
+    """argv: list of options, e.g. main(["--close-segment", "2"]) from a notebook."""
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--buffer-m", type=float, default=2000,
                     help="network buffer around the corridor in metres (default 2000)")
@@ -213,7 +216,8 @@ def main():
     ap.add_argument("--observed-source", default=None, help="name of the external source")
     ap.add_argument("--out", default="yeamans_hall_results", help="output folder")
     ap.add_argument("--no-plot", action="store_true")
-    args = ap.parse_args()
+    # parse_known_args: ignore the extra "-f kernel.json" Jupyter passes when pasted into a cell
+    args, _ = ap.parse_known_args(argv)
 
     run_date = dt.datetime.now().astimezone()
     ox.settings.use_cache = True
