@@ -10,16 +10,16 @@ MATLAB reference:
 
 Each file is transformed over its full time length, so the frequency resolution is
 df = 1 / record length (e.g. 160 s -> 0.00625 Hz) and the peaks are exact FFT bins.
+Static analysis only: one FFT per signal over its whole record - no sliding window, no animation.
 Paste into ONE Jupyter cell and run (or: python sec_mts_full_fft.py).
 
 Output (in DATA_DIR/tda_results/full_fft):
     <trial>_full_fft.png              |fx| vs f (0 .. Nyquist, MATLAB style) for SEC, MTS displacement
                                       and MTS force, with a zoom inset on the dominant peak
-    <trial>_full_fft_buildup.gif      the same FFT computed on a growing record (0 -> full length)
     All_trials_full_fft.png           all trials side by side, dominant peaks marked
     Full_FFT_peaks.xlsx               dominant frequency / period and next peaks per file
 
-Requirements: pip install numpy pandas scipy matplotlib openpyxl pillow
+Requirements: pip install numpy pandas scipy matplotlib openpyxl
 """
 
 import glob
@@ -29,17 +29,14 @@ import re
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from matplotlib import animation
 from scipy import signal
 
 try:                                    # make plots appear inside Jupyter
     from IPython import get_ipython
-    from IPython.display import Image, display
-    IN_NOTEBOOK = get_ipython() is not None
-    if IN_NOTEBOOK:
+    if get_ipython() is not None:
         get_ipython().run_line_magic("matplotlib", "inline")
 except Exception:
-    IN_NOTEBOOK = False
+    pass
 
 
 # ============================================================
@@ -67,17 +64,12 @@ F_MAX_PLOT = None                       # x-axis limit in Hz; None = up to Nyqui
 LOG_Y = False                           # True: logarithmic |fx| axis - shows the small high-frequency
                                         # peaks (e.g. 24 / 41 Hz in Force_raw_N) next to the 0.025 Hz one
 ZOOM_HZ = 0.2                           # inset zoom 0 .. ZOOM_HZ on the dominant peak; None = no inset
-F_MAX_OVERVIEW = 0.5                    # x-axis limit of the all-trials overview and the animation
+F_MAX_OVERVIEW = 0.5                    # x-axis limit of the all-trials overview
 MIN_PEAK_HZ = 0.01                      # peaks below this (drift) are not reported
 N_PEAKS = 4                             # peaks listed per signal (dominant + next strongest)
 MIN_CYCLES = 3                          # a peak's period must fit this many times into the record
 MIN_POWER_PCT = 20.0                    # dominant peak must hold >= this % of the spectrum's power,
                                         # otherwise the signal is reported as "no dominant peak"
-
-BUILDUP = True                          # animation: FFT of a growing record 0 -> full length
-BUILDUP_FRAMES = 40
-BUILDUP_FPS = 6
-BUILDUP_TRIALS = None                   # None = all trials; or e.g. ["trial_05"]
 
 RAW_COLS = {"SEC": "C1_raw_pF", "Displacement_m": "Displacement_raw_m", "Force_N": "Force_raw_N"}
 MATLAB_BLUE = "#0072BD"
@@ -219,10 +211,6 @@ def visible(w, *arrays, fmax=None):
     return (w[m],) + tuple(a[m] for a in arrays)
 
 
-def thin(t, y, n=4000):
-    k = max(1, len(t) // n)
-    return t[::k], y[::k]
-
 
 MATLAB_RC = {"font.family": "serif",
              "font.serif": ["Times New Roman", "Times", "Liberation Serif", "Nimbus Roman", "DejaVu Serif"],
@@ -293,64 +281,6 @@ def plot_trial(tr, out_dir):
     return rows
 
 
-def buildup_animation(tr, out_dir):
-    """FFT of the record from 0 to t, t growing to the full length: the peaks sharpen as the
-    record grows; the last frame is the full-length FFT."""
-    names = ["SEC"] + TARGET_COLS
-    fig, axes = plt.subplots(len(names), 2, figsize=(14, 2.6 * len(names)),
-                             gridspec_kw={"width_ratios": [1.4, 1]}, squeeze=False)
-    arts = []
-    for (ax_t, ax_f), name in zip(axes, names):
-        t, y, dt = tr["sigs"][name]
-        ax_t.plot(*thin(t, y), color="#cfcdc6", lw=0.8)
-        used, = ax_t.plot([], [], color=COLORS[name], lw=1.0)
-        ax_t.set_xlim(0, t[-1])
-        ax_t.set_ylabel(f"{'SEC' if name == 'SEC' else 'MTS ' + name.split('_')[0]}\n({UNITS[name]})", fontsize=8)
-        w_full, a_full = full_fft(y, dt)
-        line, = ax_f.plot([], [], color=COLORS[name], lw=1.4)
-        dot, = ax_f.plot([], [], "o", color="#c0392b", ms=8)
-        txt = ax_f.text(0.98, 0.95, "", transform=ax_f.transAxes, ha="right", va="top", fontsize=8.5)
-        ax_f.set_xlim(0, F_MAX_OVERVIEW or w_full[-1])
-        ax_f.set_ylim(0, 1.2 * a_full[w_full >= MIN_PEAK_HZ].max())
-        ax_f.set_ylabel("|fx|", fontsize=8)
-        for ax in (ax_t, ax_f):
-            ax.grid(color=GRID, lw=0.6)
-            ax.spines[["top", "right"]].set_visible(False)
-        arts.append((name, t, y, dt, used, line, dot, txt))
-    axes[-1, 0].set_xlabel("Time (s) - coloured part = record used so far")
-    axes[-1, 1].set_xlabel("f (Hz)")
-    title = fig.suptitle("", fontweight="bold")
-    fracs = np.linspace(0.15, 1.0, BUILDUP_FRAMES)
-
-    def update(k):
-        out = [title]
-        for name, t, y, dt, used, line, dot, txt in arts:
-            n = max(8, int(round(fracs[k] * len(t))))
-            w, amp = full_fft(y[:n], dt)
-            used.set_data(*thin(t[:n], y[:n]))
-            line.set_data(*visible(w, amp, fmax=F_MAX_OVERVIEW))
-            pk = peaks_of(w, amp, t[n - 1])
-            if is_dominant(pk):
-                dot.set_data([pk[0][0]], [pk[0][1]])
-                txt.set_text(f"dominant {pk[0][0]:.4f} Hz  (T = {1 / pk[0][0]:.1f} s)\n"
-                             f"record {t[n - 1]:.0f} s, df = {1 / (n * dt):.4f} Hz")
-            else:
-                dot.set_data([], [])
-                txt.set_text(f"no dominant peak\nrecord {t[n - 1]:.0f} s")
-            out += [used, line, dot, txt]
-        title.set_text(f"{tr['name']}: FFT of a growing record ({100 * fracs[k]:.0f}% of the full length)")
-        return out
-
-    anim = animation.FuncAnimation(fig, update, frames=BUILDUP_FRAMES, interval=1000 / BUILDUP_FPS)
-    fig.tight_layout(rect=(0, 0, 1, 0.95))
-    gif = os.path.join(out_dir, f"{tr['name']}_full_fft_buildup.gif")
-    anim.save(gif, writer=animation.PillowWriter(fps=BUILDUP_FPS), dpi=75)
-    plt.close(fig)
-    print(f"Saved: {gif}")
-    if IN_NOTEBOOK:
-        display(Image(filename=gif))
-
-
 def plot_all(trials, out_dir):
     """All trials in one figure: one column per signal, one row per trial."""
     names = ["SEC"] + TARGET_COLS
@@ -405,8 +335,6 @@ trials = [load_trial(*p) for p in find_pairs()]
 rows = []
 for tr in trials:
     rows += plot_trial(tr, out_dir)
-    if BUILDUP and (not BUILDUP_TRIALS or tr["name"] in BUILDUP_TRIALS):
-        buildup_animation(tr, out_dir)
 plot_all(trials, out_dir)
 
 peaks = pd.DataFrame(rows)
