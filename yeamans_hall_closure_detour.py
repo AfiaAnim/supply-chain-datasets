@@ -2,7 +2,9 @@
 Yeamans Hall Road corridor: baseline route and simulated segment closure.
 
 Study corridor
-    Start : Yeamans Hall Road x Brookside Drive   (Hanahan / North Charleston, SC)
+    Start : Yeamans Hall Road x Murray Drive      (Hanahan / North Charleston, SC)
+            Brookside Drive does not meet Yeamans Hall Road; it reaches the
+            corridor via Murray Drive, so the corridor starts at Murray Drive.
     End   : Yeamans Hall Road x Dickson Avenue
     Network: drivable OpenStreetMap roads within a buffer around the corridor,
              so nearby connecting streets are available for detours.
@@ -47,17 +49,22 @@ import osmnx as ox
 import pandas as pd
 
 CORRIDOR = "Yeamans Hall Road"
-START_CROSS = "Brookside Drive"
+START_CROSS = "Murray Drive"
+# Street the study was framed around; if Murray Drive meets Yeamans Hall Road
+# more than once, the junction nearest Brookside Drive is used.
+START_NEAR = "Brookside Drive"
 END_CROSS = "Dickson Avenue"
 PLACES = ["Hanahan, South Carolina, USA", "North Charleston, South Carolina, USA"]
 
 # Geocoder queries, used only to center the download and as a fallback when the
 # street-name lookup on the graph fails.
-START_QUERY = f"{CORRIDOR} & {START_CROSS}, Hanahan, SC, USA"
-END_QUERY = f"{CORRIDOR} & {END_CROSS}, North Charleston, SC, USA"
-STREET_QUERIES = [f"{CORRIDOR}, North Charleston, SC, USA",
-                  f"{START_CROSS}, Hanahan, SC, USA",
-                  f"{END_CROSS}, North Charleston, SC, USA"]
+def geocode_queries(start_cross, end_cross):
+    """Intersection queries, then single-street queries to size the download."""
+    return ([f"{CORRIDOR} & {start_cross}, Hanahan, SC, USA",
+             f"{CORRIDOR} & {end_cross}, North Charleston, SC, USA"],
+            [f"{CORRIDOR}, North Charleston, SC, USA",
+             f"{start_cross}, Hanahan, SC, USA",
+             f"{end_cross}, North Charleston, SC, USA"])
 
 # Fallback free-flow speeds (mph) for highway classes without a maxspeed tag.
 DEFAULT_SPEEDS_MPH = {
@@ -120,18 +127,19 @@ def overpass_retry(fn, *args, rounds=3, wait_s=10, **kwargs):
     raise RuntimeError("Every Overpass server failed; try again in a few minutes.") from last
 
 
-def download_network(buffer_m, start_pt=None, end_pt=None):
+def download_network(buffer_m, start_pt=None, end_pt=None, start_cross=START_CROSS, end_cross=END_CROSS):
     """Drivable network around the corridor, buffered to include detour streets.
 
     start_pt / end_pt are (lat, lon) overrides; otherwise the intersections are
     geocoded. Each street is also geocoded on its own so the download covers all
     three streets even when an intersection lookup fails.
     """
-    start_pt = start_pt or geocode(START_QUERY)
-    end_pt = end_pt or geocode(END_QUERY)
+    (start_q, end_q), street_queries = geocode_queries(start_cross, end_cross)
+    start_pt = start_pt or geocode(start_q)
+    end_pt = end_pt or geocode(end_q)
     pts = [p for p in (start_pt, end_pt) if p]
     if len(pts) < 2:
-        for q in STREET_QUERIES:
+        for q in street_queries:
             p = geocode(q)
             print(f"  geocode '{q}': {p if p else 'not found'}")
             if p:
@@ -179,7 +187,7 @@ def similar_names(G, street):
     return sorted(found)
 
 
-def intersection_node(G, street_a, street_b, fallback_point=None, max_gap_m=150):
+def intersection_node(G, street_a, street_b, fallback_point=None, max_gap_m=150, near_street=None):
     """Node on street_a where it meets street_b.
 
     1. a node shared by both streets (true junction);
@@ -187,15 +195,22 @@ def intersection_node(G, street_a, street_b, fallback_point=None, max_gap_m=150)
        (divided roads / slightly offset junctions in OSM);
     3. the street_a node nearest the geocoded/override point;
     4. the street_a node closest to street_b at any distance, with a warning.
+    If streets meet more than once, the junction nearest fallback_point, else
+    nearest near_street, is used.
     """
     na, nb = street_nodes(G, street_a), street_nodes(G, street_b)
     shared = na & nb
     if shared:
         cands = sorted(shared)
-        if len(cands) > 1 and fallback_point:
-            lat, lon = fallback_point
-            cands.sort(key=lambda n: ox.distance.great_circle(
-                lat, lon, G.nodes[n]["y"], G.nodes[n]["x"]))
+        refs = [fallback_point] if fallback_point else [
+            (G.nodes[n]["y"], G.nodes[n]["x"]) for n in (street_nodes(G, near_street) if near_street else ())]
+        if len(cands) > 1 and refs:
+            cands.sort(key=lambda n: min(ox.distance.great_circle(
+                lat, lon, G.nodes[n]["y"], G.nodes[n]["x"]) for lat, lon in refs))
+        if len(cands) > 1:
+            print(f"  {street_a} meets {street_b} at {len(cands)} points; using "
+                  f"({G.nodes[cands[0]]['y']:.6f}, {G.nodes[cands[0]]['x']:.6f})"
+                  + (f", nearest {near_street}" if near_street and not fallback_point else ""))
         return cands[0], "street-name match on OSM graph"
     gap = best = None
     if na and nb:
@@ -282,10 +297,14 @@ def main(argv=None):
     ap.add_argument("--close-segment", type=int, default=None,
                     help="index of the Yeamans Hall Road segment to close (default: middle one)")
     ap.add_argument("--list-segments", action="store_true", help="list closable segments and exit")
+    ap.add_argument("--start-cross", default=START_CROSS,
+                    help=f"cross street at the corridor start (default {START_CROSS})")
+    ap.add_argument("--end-cross", default=END_CROSS,
+                    help=f"cross street at the corridor end (default {END_CROSS})")
     ap.add_argument("--start-latlon", type=float, nargs=2, metavar=("LAT", "LON"), default=None,
-                    help="override coordinates of Yeamans Hall Rd x Brookside Dr")
+                    help="override coordinates of the start intersection")
     ap.add_argument("--end-latlon", type=float, nargs=2, metavar=("LAT", "LON"), default=None,
-                    help="override coordinates of Yeamans Hall Rd x Dickson Ave")
+                    help="override coordinates of the end intersection")
     ap.add_argument("--observed-distance-mi", type=float, default=None,
                     help="baseline distance measured externally (e.g. Google Maps), for the record")
     ap.add_argument("--observed-time-min", type=float, default=None,
@@ -307,13 +326,15 @@ def main(argv=None):
         OVERPASS_URLS.insert(0, args.overpass_url.rstrip("/"))
 
     # 1. network ------------------------------------------------------------
-    G, (start_pt, end_pt) = download_network(args.buffer_m, args.start_latlon, args.end_latlon)
+    G, (start_pt, end_pt) = download_network(args.buffer_m, args.start_latlon, args.end_latlon,
+                                            args.start_cross, args.end_cross)
     G = add_travel_times(G)
     print(f"Network: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
 
     # 2. intersections ------------------------------------------------------
-    orig, orig_how = intersection_node(G, CORRIDOR, START_CROSS, start_pt)
-    dest, dest_how = intersection_node(G, CORRIDOR, END_CROSS, end_pt)
+    orig, orig_how = intersection_node(G, CORRIDOR, args.start_cross, start_pt,
+                                       near_street=START_NEAR if args.start_cross == START_CROSS else None)
+    dest, dest_how = intersection_node(G, CORRIDOR, args.end_cross, end_pt)
     print(f"Start node {orig} ({G.nodes[orig]['y']:.6f}, {G.nodes[orig]['x']:.6f}) via {orig_how}")
     print(f"End node   {dest} ({G.nodes[dest]['y']:.6f}, {G.nodes[dest]['x']:.6f}) via {dest_how}")
 
@@ -366,10 +387,10 @@ def main(argv=None):
     pd.DataFrame(alt_rows).to_csv(os.path.join(args.out, "detour_route_edges.csv"), index=False)
 
     record = {
-        "study_corridor": f"{CORRIDOR} between {START_CROSS} and {END_CROSS}",
-        "start": {"intersection": f"{CORRIDOR} x {START_CROSS}", "osm_node": int(orig),
+        "study_corridor": f"{CORRIDOR} between {args.start_cross} and {args.end_cross}",
+        "start": {"intersection": f"{CORRIDOR} x {args.start_cross}", "osm_node": int(orig),
                   "lat": G.nodes[orig]["y"], "lon": G.nodes[orig]["x"], "located_by": orig_how},
-        "end": {"intersection": f"{CORRIDOR} x {END_CROSS}", "osm_node": int(dest),
+        "end": {"intersection": f"{CORRIDOR} x {args.end_cross}", "osm_node": int(dest),
                 "lat": G.nodes[dest]["y"], "lon": G.nodes[dest]["x"], "located_by": dest_how},
         "measurement_source": (f"OpenStreetMap drive network via OSMnx {ox.__version__} "
                                "(Overpass API); fastest path by free-flow travel time"),
