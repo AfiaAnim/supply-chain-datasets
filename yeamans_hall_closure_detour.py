@@ -183,9 +183,10 @@ def intersection_node(G, street_a, street_b, fallback_point=None, max_gap_m=150)
     """Node on street_a where it meets street_b.
 
     1. a node shared by both streets (true junction);
-    2. otherwise the street_a node closest to any street_b node, if within
-       max_gap_m (covers divided roads / slightly offset junctions in OSM);
-    3. otherwise the node nearest the geocoded/override point.
+    2. the street_a node closest to street_b, if within max_gap_m
+       (divided roads / slightly offset junctions in OSM);
+    3. the street_a node nearest the geocoded/override point;
+    4. the street_a node closest to street_b at any distance, with a warning.
     """
     na, nb = street_nodes(G, street_a), street_nodes(G, street_b)
     shared = na & nb
@@ -196,10 +197,11 @@ def intersection_node(G, street_a, street_b, fallback_point=None, max_gap_m=150)
             cands.sort(key=lambda n: ox.distance.great_circle(
                 lat, lon, G.nodes[n]["y"], G.nodes[n]["x"]))
         return cands[0], "street-name match on OSM graph"
+    gap = best = None
     if na and nb:
-        gap, best = min(
+        gap, best, other = min(
             (ox.distance.great_circle(G.nodes[a]["y"], G.nodes[a]["x"],
-                                      G.nodes[b]["y"], G.nodes[b]["x"]), a)
+                                      G.nodes[b]["y"], G.nodes[b]["x"]), a, b)
             for a in na for b in nb)
         if gap <= max_gap_m:
             return best, f"closest {street_a} node to {street_b} ({gap:.0f} m apart)"
@@ -209,6 +211,12 @@ def intersection_node(G, street_a, street_b, fallback_point=None, max_gap_m=150)
         pool = na or G.nodes
         node = min(pool, key=lambda n: ox.distance.great_circle(lat, lon, G.nodes[n]["y"], G.nodes[n]["x"]))
         return node, "nearest corridor node to geocoded/given point"
+    if best is not None:
+        print(f"WARNING: {street_a} and {street_b} do not meet in OSM; closest approach is {gap:.0f} m.\n"
+              f"  Using {street_a} point ({G.nodes[best]['y']:.6f}, {G.nodes[best]['x']:.6f});\n"
+              f"  nearest {street_b} point ({G.nodes[other]['y']:.6f}, {G.nodes[other]['x']:.6f}).\n"
+              "  Paste these into Google Maps to check; if wrong, pass --start-latlon / --end-latlon.")
+        return best, f"closest {street_a} node to {street_b} ({gap:.0f} m apart, no shared junction in OSM)"
     raise RuntimeError(
         f"Could not find the intersection of {street_a} and {street_b}.\n"
         f"  Streets in the downloaded network like '{street_a}': {similar_names(G, street_a) or 'none'}\n"
