@@ -89,6 +89,16 @@ CAPACITY_VPH_PER_LANE = {
 BPR_ALPHA, BPR_BETA = 0.15, 4
 
 M_PER_MI = 1609.344
+# The study area is ~3 km across; a geocoded point farther than OUTLIER_M from the
+# others is a wrong match (same street name elsewhere) and is ignored, and the
+# download radius is capped so a bad lookup cannot trigger a huge download.
+OUTLIER_M = 6000
+MAX_RADIUS_M = 4000
+T0 = time.time()
+
+
+def step(msg):
+    print(f"[{time.time() - T0:6.0f} s] {msg}", flush=True)
 
 OVERPASS_URLS = [
     "https://overpass-api.de/api",
@@ -142,12 +152,13 @@ def geocode(query):
         return None
 
 
-def overpass_retry(fn, *args, rounds=3, wait_s=10, **kwargs):
+def overpass_retry(fn, *args, rounds=2, wait_s=10, **kwargs):
     """Call an OSMnx download, rotating through Overpass servers with backoff."""
     last = None
     for r in range(rounds):
         for url in OVERPASS_URLS:
             ox.settings.overpass_url = url
+            step(f"requesting road data from {url} ...")
             try:
                 return fn(*args, **kwargs)
             except Exception as e:  # busy server, timeout, bad gateway, ...
@@ -168,12 +179,19 @@ def download_network(buffer_m, extra_points):
         if p:
             pts.append(p)
     if pts:
-        lat = sum(p[0] for p in pts) / len(pts)
-        lon = sum(p[1] for p in pts) / len(pts)
-        dist = max(ox.distance.great_circle(lat, lon, *p) for p in pts) + buffer_m
-        print(f"Downloading drive network: center=({lat:.5f}, {lon:.5f}), radius={dist:.0f} m")
+        mlat = sorted(p[0] for p in pts)[len(pts) // 2]
+        mlon = sorted(p[1] for p in pts)[len(pts) // 2]
+        good = [p for p in pts if ox.distance.great_circle(mlat, mlon, *p) <= OUTLIER_M]
+        for p in pts:
+            if p not in good:
+                print(f"  ignoring far-away geocode result {p} (probably the wrong street)")
+        lat = sum(p[0] for p in good) / len(good)
+        lon = sum(p[1] for p in good) / len(good)
+        dist = min(max(ox.distance.great_circle(lat, lon, *p) for p in good) + buffer_m, MAX_RADIUS_M)
+        step(f"downloading drive network: center=({lat:.5f}, {lon:.5f}), radius={dist:.0f} m. "
+             "This is the slow step (usually 1-5 min the first time, instant once cached).")
         return overpass_retry(ox.graph_from_point, (lat, lon), dist=dist, network_type="drive")
-    print(f"Geocoding failed; downloading drive network for {PLACES}")
+    step(f"geocoding failed; downloading all of {PLACES} (slow - pass --school-latlon to avoid this)")
     return overpass_retry(ox.graph_from_place, PLACES, network_type="drive")
 
 
@@ -335,10 +353,13 @@ def main(argv=None):
         argv = [str(a) for a in argv]
     args, _ = ap.parse_known_args(argv)  # ignore Jupyter's "-f kernel.json"
 
+    global T0
+    T0 = time.time()
     run_date = dt.datetime.now().astimezone()
     ox.settings.use_cache = True
     ox.settings.log_console = False
-    ox.settings.requests_timeout = 300
+    ox.settings.requests_timeout = 90      # give up on a stuck server sooner, try the next one
+    ox.settings.overpass_rate_limit = False  # don't sit waiting for a slot on a busy server
 
     zones = [] if args.only_circles else [dict(z) for z in FLOOD_ZONES]
     for i, (lat, lon, r) in enumerate(args.flood_circle, 1):
@@ -347,11 +368,12 @@ def main(argv=None):
         raise SystemExit("No flood zones defined.")
 
     # 1. network --------------------------------------------------------------
+    step("looking up street locations (geocoding)")
     extra = [tuple(args.school_latlon)] if args.school_latlon else []
     extra += [(z["lat"], z["lon"]) for z in zones if "lat" in z]
     G = download_network(args.buffer_m, extra)
     G = add_travel_times_and_capacity(G)
-    print(f"Network: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
+    step(f"network ready: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
 
     # 2. school ---------------------------------------------------------------
     school_pt = tuple(args.school_latlon) if args.school_latlon else geocode(SCHOOL_QUERY)
@@ -364,6 +386,7 @@ def main(argv=None):
           f"({dist_m(G, school, *school_pt):.0f} m away)")
 
     # 3. flooding and origins ---------------------------------------------------
+    step("marking flooded roads")
     hits = mark_flooded(G, zones)
     flooded = [e for es in hits.values() for e in es]
     if not flooded:
@@ -381,6 +404,7 @@ def main(argv=None):
     print(f"Origins (intersections within {args.affected_radius_m:.0f} m of flooding): {len(origins)}")
 
     # 4. routing: normal vs flooded (free flow) -----------------------------------
+    step("routing every origin to the school")
     t_norm, p_norm = routes_to(G, school, "t0", set())
     t_fl, p_fl = routes_to(G, school, "t0", all_zones)
 
@@ -409,6 +433,7 @@ def main(argv=None):
     origins = list(df["origin_node"])
 
     # 5a. congestion-aware assignment -----------------------------------------
+    step(f"congestion-aware assignment ({args.assign_iterations} iterations)")
     loads = {}
     if args.assign_iterations > 0:
         reachable = list(df.loc[df["status"] != "stranded", "origin_node"])
@@ -440,6 +465,7 @@ def main(argv=None):
         crit_df = crit_df.sort_values("peak_vehicles_per_hour", ascending=False)
 
     # 5c. mitigation priority: reopen one zone at a time ---------------------------
+    step("ranking flood zones for mitigation")
     base = evaluate(G, origins, school, all_zones)
     normal = {o: t_norm[o] for o in origins}
 
