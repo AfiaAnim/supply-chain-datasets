@@ -36,8 +36,9 @@ Usage
     python flood_rerouting_hanahan_ms.py
     Jupyter:  %run flood_rerouting_hanahan_ms.py   or paste into a cell; then
               main(["--vehicles-per-origin", 15])
-    Coordinates you know better than the geocoder:
-              --school-latlon LAT LON
+    Options:
+              --school-latlon LAT LON         (default: Hanahan Middle School below)
+              --radius-m 4500                 (enlarge the download if a street is missing)
               --flood-circle LAT LON RADIUS_M   (repeatable; adds a flood zone)
 """
 
@@ -52,7 +53,7 @@ import osmnx as ox
 import pandas as pd
 
 SCHOOL_NAME = "Hanahan Middle School"
-SCHOOL_QUERY = "Hanahan Middle School, Hanahan, SC, USA"
+SCHOOL_LATLON = (32.90752, -79.994)
 
 # Flood zones (circled on the study map). Each zone blocks the edges matching:
 #   street            - street name (abbreviations like "Rd" are handled)
@@ -64,15 +65,6 @@ FLOOD_ZONES = [
     {"name": "Dickson Avenue (south end)", "street": "Dickson Avenue",
      "near": "Remount Road", "radius_m": 450},
 ]
-
-# Used only to size the download area.
-AREA_QUERIES = [
-    "Sellers Road, North Charleston, SC, USA",
-    "Dickson Avenue, North Charleston, SC, USA",
-    "Remount Road, North Charleston, SC, USA",
-    SCHOOL_QUERY,
-]
-PLACES = ["Hanahan, South Carolina, USA", "North Charleston, South Carolina, USA"]
 
 # Free-flow speeds (mph) for highway classes without a maxspeed tag.
 DEFAULT_SPEEDS_MPH = {
@@ -89,11 +81,9 @@ CAPACITY_VPH_PER_LANE = {
 BPR_ALPHA, BPR_BETA = 0.15, 4
 
 M_PER_MI = 1609.344
-# The study area is ~3 km across; a geocoded point farther than OUTLIER_M from the
-# others is a wrong match (same street name elsewhere) and is ignored, and the
-# download radius is capped so a bad lookup cannot trigger a huge download.
-OUTLIER_M = 6000
-MAX_RADIUS_M = 4000
+# Roads within this distance of the school are downloaded; it covers Sellers Rd,
+# the south end of Dickson Ave and the detour streets between them and the school.
+DOWNLOAD_RADIUS_M = 3500
 T0 = time.time()
 
 
@@ -145,13 +135,6 @@ def edge_mid(G, u, v):
     return ((G.nodes[u]["y"] + G.nodes[v]["y"]) / 2, (G.nodes[u]["x"] + G.nodes[v]["x"]) / 2)
 
 
-def geocode(query):
-    try:
-        return tuple(ox.geocode(query))
-    except Exception:
-        return None
-
-
 def overpass_retry(fn, *args, rounds=2, wait_s=10, **kwargs):
     """Call an OSMnx download, rotating through Overpass servers with backoff."""
     last = None
@@ -171,28 +154,10 @@ def overpass_retry(fn, *args, rounds=2, wait_s=10, **kwargs):
     raise RuntimeError("Every Overpass server failed; try again in a few minutes.") from last
 
 
-def download_network(buffer_m, extra_points):
-    pts = list(extra_points)
-    for q in AREA_QUERIES:
-        p = geocode(q)
-        print(f"  geocode '{q}': {p if p else 'not found'}")
-        if p:
-            pts.append(p)
-    if pts:
-        mlat = sorted(p[0] for p in pts)[len(pts) // 2]
-        mlon = sorted(p[1] for p in pts)[len(pts) // 2]
-        good = [p for p in pts if ox.distance.great_circle(mlat, mlon, *p) <= OUTLIER_M]
-        for p in pts:
-            if p not in good:
-                print(f"  ignoring far-away geocode result {p} (probably the wrong street)")
-        lat = sum(p[0] for p in good) / len(good)
-        lon = sum(p[1] for p in good) / len(good)
-        dist = min(max(ox.distance.great_circle(lat, lon, *p) for p in good) + buffer_m, MAX_RADIUS_M)
-        step(f"downloading drive network: center=({lat:.5f}, {lon:.5f}), radius={dist:.0f} m. "
-             "This is the slow step (usually 1-5 min the first time, instant once cached).")
-        return overpass_retry(ox.graph_from_point, (lat, lon), dist=dist, network_type="drive")
-    step(f"geocoding failed; downloading all of {PLACES} (slow - pass --school-latlon to avoid this)")
-    return overpass_retry(ox.graph_from_place, PLACES, network_type="drive")
+def download_network(center, radius_m):
+    step(f"downloading drive network within {radius_m:.0f} m of ({center[0]:.5f}, {center[1]:.5f}). "
+         "This is the slow step (usually 1-5 min the first time, instant once cached).")
+    return overpass_retry(ox.graph_from_point, center, dist=radius_m, network_type="drive")
 
 
 def add_travel_times_and_capacity(G):
@@ -253,6 +218,9 @@ def mark_flooded(G, zones):
             hits[z["name"]].append((u, v, k))
         segs = {frozenset((u, v)) for u, v, _ in hits[z["name"]]}
         print(f"  flood zone '{z['name']}': {len(segs)} road segment(s) blocked")
+        if not segs:
+            print(f"WARNING: no roads matched '{z['name']}'; it may lie outside the download "
+                  "(try --radius-m 4500) or need a --flood-circle")
     return hits
 
 
@@ -335,9 +303,10 @@ def evaluate(G, origins, dest, closed_zones):
 def main(argv=None):
     """argv: list of options, e.g. main(["--vehicles-per-origin", 15]) from a notebook."""
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--buffer-m", type=float, default=1500, help="extra download margin (m)")
-    ap.add_argument("--school-latlon", type=float, nargs=2, metavar=("LAT", "LON"), default=None,
-                    help=f"coordinates of {SCHOOL_NAME} (default: geocoded)")
+    ap.add_argument("--radius-m", type=float, default=DOWNLOAD_RADIUS_M,
+                    help=f"download roads within this distance of the school (default {DOWNLOAD_RADIUS_M})")
+    ap.add_argument("--school-latlon", type=float, nargs=2, metavar=("LAT", "LON"), default=SCHOOL_LATLON,
+                    help=f"coordinates of {SCHOOL_NAME} (default {SCHOOL_LATLON})")
     ap.add_argument("--flood-circle", type=float, nargs=3, action="append", default=[],
                     metavar=("LAT", "LON", "RADIUS_M"), help="add a circular flood zone (repeatable)")
     ap.add_argument("--only-circles", action="store_true",
@@ -368,18 +337,12 @@ def main(argv=None):
         raise SystemExit("No flood zones defined.")
 
     # 1. network --------------------------------------------------------------
-    step("looking up street locations (geocoding)")
-    extra = [tuple(args.school_latlon)] if args.school_latlon else []
-    extra += [(z["lat"], z["lon"]) for z in zones if "lat" in z]
-    G = download_network(args.buffer_m, extra)
+    school_pt = tuple(args.school_latlon)
+    G = download_network(school_pt, args.radius_m)
     G = add_travel_times_and_capacity(G)
     step(f"network ready: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
 
     # 2. school ---------------------------------------------------------------
-    school_pt = tuple(args.school_latlon) if args.school_latlon else geocode(SCHOOL_QUERY)
-    if not school_pt:
-        raise SystemExit(f"Could not geocode {SCHOOL_NAME}; pass --school-latlon LAT LON "
-                         "(right-click the school in Google Maps to copy them).")
     main_cc = max(nx.strongly_connected_components(G), key=len)
     school = min(main_cc, key=lambda n: dist_m(G, n, *school_pt))
     print(f"{SCHOOL_NAME}: ({school_pt[0]:.6f}, {school_pt[1]:.6f}) -> node {school} "
