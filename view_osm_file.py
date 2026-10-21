@@ -154,6 +154,15 @@ def plot_interactive(G, highlight, path):
     if importlib.util.find_spec("folium") is None:  # GeoDataFrame.explore needs folium
         print("Interactive map skipped (pip install folium mapclassify to enable).")
         return None
+    try:
+        return _explore(G, highlight, path)
+    except ImportError as e:  # folium present but branca/jinja2/mapclassify missing
+        print(f"Interactive map skipped ({str(e).splitlines()[0][:90]}...). "
+              "Fix: pip install folium mapclassify jinja2")
+        return None
+
+
+def _explore(G, highlight, path):
     edges = ox.graph_to_gdfs(G, nodes=False).reset_index()
     for col in ("name", "highway"):
         edges[col] = edges[col].apply(lambda x: ", ".join(map(str, x)) if isinstance(x, list) else x)
