@@ -45,7 +45,9 @@ Usage
 import argparse
 import datetime as dt
 import json
+import math
 import os
+import sys
 import time
 
 import networkx as nx
@@ -298,7 +300,160 @@ def evaluate(G, origins, dest, closed_zones):
     return {o: times.get(o) for o in origins}
 
 
-# --- main --------------------------------------------------------------------
+# --- map -------------------------------------------------------------------------
+
+STATUS_STYLE = {  # origin status -> (colour, legend text)
+    "unaffected": ("#8c8c8c", "Origin, normal route stays dry"),
+    "rerouted": ("#f28e2b", "Origin, must detour around flooding"),
+    "stranded": ("#000000", "Origin, stranded (no dry route)"),
+}
+
+
+def edge_xy(G, u, v, k):
+    """Edge drawn along its real shape when OSM provides one."""
+    geom = G.edges[u, v, k].get("geometry")
+    if geom is not None:
+        xs, ys = geom.xy
+        return list(xs), list(ys)
+    return [G.nodes[u]["x"], G.nodes[v]["x"]], [G.nodes[u]["y"], G.nodes[v]["y"]]
+
+
+def place_label(ax, G, edges, text, color, placed, weight="normal", size=7):
+    """Label a street on its longest visible edge, rotated along the road."""
+    import matplotlib.patheffects as pe
+    x0, x1 = ax.get_xlim()
+    y0, y1 = ax.get_ylim()
+    best = None
+    for e in edges:
+        xs, ys = edge_xy(G, *e)
+        mx, my = (xs[0] + xs[-1]) / 2, (ys[0] + ys[-1]) / 2
+        if not (x0 < mx < x1 and y0 < my < y1):
+            continue
+        if best is None or G.edges[e]["length"] > best[0]:
+            best = (G.edges[e]["length"], xs, ys, mx, my)
+    if best is None:
+        return
+    _, xs, ys, mx, my = best
+    (px0, py0), (px1, py1) = ax.transData.transform([(xs[0], ys[0]), (xs[-1], ys[-1])])
+    pmx, pmy = ax.transData.transform((mx, my))
+    if any((pmx - a) ** 2 + (pmy - b) ** 2 < 45 ** 2 for a, b in placed):
+        return  # would overlap an existing label
+    placed.append((pmx, pmy))
+    angle = math.degrees(math.atan2(py1 - py0, px1 - px0))
+    if angle > 90:
+        angle -= 180
+    elif angle < -90:
+        angle += 180
+    ax.text(mx, my, text, color=color, fontsize=size, fontweight=weight, rotation=angle,
+            rotation_mode="anchor", ha="center", va="center", zorder=8,
+            path_effects=[pe.withStroke(linewidth=3, foreground="white")])
+
+
+def plot_map(G, df, loads, flooded, crit_df, school_pt, zones, path, n_detour_labels=6):
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
+    fig, ax = plt.subplots(figsize=(11, 10))
+    fig.patch.set_facecolor("white")
+    for u, v, k in G.edges(keys=True):
+        xs, ys = edge_xy(G, u, v, k)
+        ax.plot(xs, ys, color="#d4d4d4", lw=0.7, zorder=1)
+
+    vmax = max(loads.values()) if loads and max(loads.values()) > 0 else 1
+    used = [(e, val) for e, val in loads.items() if val > 0]
+    for e, val in used:
+        xs, ys = edge_xy(G, *e)
+        ax.plot(xs, ys, color="#1f77b4", lw=1 + 6 * val / vmax, alpha=0.75,
+                solid_capstyle="round", zorder=3)
+    for e in flooded:
+        xs, ys = edge_xy(G, *e)
+        ax.plot(xs, ys, color="#d62728", lw=5, solid_capstyle="round", zorder=4)
+    for status, (color, _) in STATUS_STYLE.items():
+        grp = df[df["status"] == status]
+        ax.scatter(grp["lon"], grp["lat"], s=22, color=color, edgecolor="white",
+                   linewidth=0.5, zorder=5)
+    ax.scatter([school_pt[1]], [school_pt[0]], marker="*", s=420, color="gold",
+               edgecolor="black", zorder=7)
+    ax.annotate(SCHOOL_NAME, (school_pt[1], school_pt[0]), xytext=(10, 10),
+                textcoords="offset points", fontsize=9, fontweight="bold", zorder=9,
+                bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="black", lw=0.6))
+
+    # zoom to the affected area: origins, school, flooded and used roads
+    xs = list(df["lon"]) + [school_pt[1]]
+    ys = list(df["lat"]) + [school_pt[0]]
+    for e in [e for e, _ in used] + list(flooded):
+        ex, ey = edge_xy(G, *e)
+        xs += ex
+        ys += ey
+    pad_x = (max(xs) - min(xs)) * 0.15 + 0.002
+    pad_y = (max(ys) - min(ys)) * 0.15 + 0.002
+    ax.set_xlim(min(xs) - pad_x, max(xs) + pad_x)
+    ax.set_ylim(min(ys) - pad_y, max(ys) + pad_y)
+    ax.set_aspect(1 / math.cos(math.radians(school_pt[0])))
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.apply_aspect()
+
+    # road names: flooded streets, busiest detour roads, then major context roads
+    by_name = {}
+    for u, v, k, d in G.edges(keys=True, data=True):
+        name = first(d.get("name"))
+        if name:
+            by_name.setdefault(name, []).append((u, v, k))
+    placed = []
+    flooded_names = []
+    for e in flooded:
+        name = first(G.edges[e].get("name"))
+        if name and name not in flooded_names:
+            flooded_names.append(name)
+    for name in flooded_names:
+        place_label(ax, G, [e for e in flooded if first(G.edges[e].get("name")) == name],
+                    f"{name} (FLOODED)", "#b22222", placed, weight="bold", size=8)
+    used_set = {e for e, _ in used}
+    detour_names = [n for n in (crit_df["road"].tolist() if len(crit_df) else [])
+                    if n in by_name and n not in flooded_names][:n_detour_labels]
+    for name in detour_names:
+        place_label(ax, G, [e for e in by_name[name] if e in used_set] or by_name[name],
+                    name, "#164f7a", placed, weight="bold", size=8)
+    major = {"motorway", "trunk", "primary", "secondary", "tertiary"}
+    for name, edges in sorted(by_name.items(), key=lambda kv: -sum(G.edges[e]["length"] for e in kv[1])):
+        if name in flooded_names or name in detour_names:
+            continue
+        if any(first(G.edges[e].get("highway")) in major for e in edges):
+            place_label(ax, G, edges, name, "#555555", placed)
+    # a few residential street names for orientation
+    for name, edges in sorted(by_name.items(), key=lambda kv: -sum(G.edges[e]["length"] for e in kv[1]))[:60]:
+        if name not in flooded_names and name not in detour_names:
+            place_label(ax, G, edges, name, "#777777", placed, size=6)
+
+    handles = [
+        Line2D([], [], color="#d62728", lw=5, label="Flooded road (closed to traffic)"),
+        Line2D([], [], color="#1f77b4", lw=1.5, alpha=0.75, label="Evacuation route, few vehicles"),
+        Line2D([], [], color="#1f77b4", lw=7, alpha=0.75, label="Evacuation route, many vehicles"),
+        Line2D([], [], color="#d4d4d4", lw=1.5, label="Other roads"),
+    ] + [Line2D([], [], marker="o", ls="", color=c, markeredgecolor="white", markersize=7, label=t)
+         for c, t in STATUS_STYLE.values()] + [
+        Line2D([], [], marker="*", ls="", color="gold", markeredgecolor="black", markersize=15,
+               label=f"{SCHOOL_NAME} (destination)"),
+    ]
+    counts = df["status"].value_counts()
+    ax.set_title(f"Flood rerouting to {SCHOOL_NAME}\n"
+                 f"{', '.join(z['name'] for z in zones)} closed  |  "
+                 f"{counts.get('rerouted', 0)} origins rerouted, {counts.get('stranded', 0)} stranded, "
+                 f"{counts.get('unaffected', 0)} unaffected", fontsize=11)
+    fig.legend(handles=handles, loc="lower center", ncol=3, fontsize=8.5, frameon=False,
+               bbox_to_anchor=(0.5, 0.0))
+    fig.text(0.5, 0.075, "Line width = number of evacuating vehicles on that road "
+             "(congestion-aware assignment). Road names: red = flooded, blue = busiest detour roads.",
+             ha="center", fontsize=8, color="#444444")
+    fig.subplots_adjust(bottom=0.14, top=0.93, left=0.02, right=0.98)
+    fig.savefig(path, dpi=200)
+    if "ipykernel" in sys.modules:
+        plt.show()  # also display inline in Jupyter
+    plt.close(fig)
+
+
+# --- main --------------------------------------------------------------------------
 
 def main(argv=None):
     """argv: list of options, e.g. main(["--vehicles-per-origin", 15]) from a notebook."""
@@ -506,28 +661,8 @@ def main(argv=None):
         json.dump(record, f, indent=2, default=str)
 
     if not args.no_plot:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        fig, ax = ox.plot_graph(G, node_size=0, edge_color="#cccccc", edge_linewidth=0.6,
-                                bgcolor="white", show=False, close=False)
-        vmax = max(loads.values()) if loads and max(loads.values()) > 0 else 1
-        for (u, v, k), val in loads.items():
-            if val > 0:
-                ax.plot([G.nodes[u]["x"], G.nodes[v]["x"]], [G.nodes[u]["y"], G.nodes[v]["y"]],
-                        color="tab:blue", lw=1 + 5 * val / vmax, alpha=0.7, zorder=3)
-        for u, v, _ in flooded:
-            ax.plot([G.nodes[u]["x"], G.nodes[v]["x"]], [G.nodes[u]["y"], G.nodes[v]["y"]],
-                    color="tab:red", lw=4, zorder=4)
-        colors = {"unaffected": "#999999", "rerouted": "tab:orange", "stranded": "black"}
-        for status, grp in df.groupby("status"):
-            ax.scatter(grp["lon"], grp["lat"], s=18, color=colors[status], label=status, zorder=5)
-        ax.scatter([school_pt[1]], [school_pt[0]], marker="*", s=300, color="gold",
-                   edgecolor="black", label=SCHOOL_NAME, zorder=6)
-        ax.legend(loc="lower right", fontsize=8)
-        ax.set_title("Flooded roads (red), evacuation traffic to school (blue, width = volume)")
-        fig.savefig(os.path.join(args.out, "flood_rerouting_map.png"), dpi=200, bbox_inches="tight")
-        plt.close(fig)
+        plot_map(G, df, loads, flooded, crit_df, school_pt, zones,
+                 os.path.join(args.out, "flood_rerouting_map.png"))
 
     print(f"\nOutputs written to {os.path.abspath(args.out)}/")
     return df
