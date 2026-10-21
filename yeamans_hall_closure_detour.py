@@ -178,7 +178,10 @@ def intersection_node(G, street_a, street_b, fallback_point=None, max_gap_m=150)
             return best, f"closest {street_a} node to {street_b} ({gap:.0f} m apart)"
     if fallback_point:
         lat, lon = fallback_point
-        return ox.distance.nearest_nodes(G, lon, lat), "nearest node to geocoded/given point"
+        # prefer a corridor node; plain search avoids nearest_nodes' scikit-learn dependency
+        pool = na or G.nodes
+        node = min(pool, key=lambda n: ox.distance.great_circle(lat, lon, G.nodes[n]["y"], G.nodes[n]["x"]))
+        return node, "nearest corridor node to geocoded/given point"
     raise RuntimeError(
         f"Could not find the intersection of {street_a} and {street_b}.\n"
         f"  Streets in the downloaded network like '{street_a}': {similar_names(G, street_a) or 'none'}\n"
