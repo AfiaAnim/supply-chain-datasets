@@ -40,6 +40,7 @@ import datetime as dt
 import json
 import os
 import sys
+import time
 
 import networkx as nx
 import osmnx as ox
@@ -67,6 +68,14 @@ DEFAULT_SPEEDS_MPH = {
 
 M_PER_MI = 1609.344
 
+# Public Overpass servers, tried in order; the main one is often "at capacity".
+OVERPASS_URLS = [
+    "https://overpass-api.de/api",
+    "https://overpass.kumi.systems/api",
+    "https://overpass.private.coffee/api",
+    "https://maps.mail.ru/osm/tools/overpass/api",
+]
+
 
 def norm(name):
     """Lower-case a street name and expand common suffix abbreviations."""
@@ -93,6 +102,24 @@ def geocode(query):
         return None
 
 
+def overpass_retry(fn, *args, rounds=3, wait_s=10, **kwargs):
+    """Call an OSMnx download, rotating through Overpass servers with backoff."""
+    last = None
+    for r in range(rounds):
+        for url in OVERPASS_URLS:
+            ox.settings.overpass_url = url
+            try:
+                return fn(*args, **kwargs)
+            except Exception as e:  # busy server, timeout, bad gateway, ...
+                last = e
+                print(f"  Overpass {url} failed ({type(e).__name__}: {str(e).splitlines()[0][:80]})")
+        if r < rounds - 1:
+            print(f"  all servers busy; retrying in {wait_s} s")
+            time.sleep(wait_s)
+            wait_s *= 2
+    raise RuntimeError("Every Overpass server failed; try again in a few minutes.") from last
+
+
 def download_network(buffer_m, start_pt=None, end_pt=None):
     """Drivable network around the corridor, buffered to include detour streets.
 
@@ -115,10 +142,10 @@ def download_network(buffer_m, start_pt=None, end_pt=None):
         reach = max(ox.distance.great_circle(lat, lon, *p) for p in pts)
         dist = reach + buffer_m
         print(f"Downloading drive network: center=({lat:.5f}, {lon:.5f}), radius={dist:.0f} m")
-        G = ox.graph_from_point((lat, lon), dist=dist, network_type="drive", simplify=True)
+        G = overpass_retry(ox.graph_from_point, (lat, lon), dist=dist, network_type="drive", simplify=True)
     else:
         print(f"Geocoding failed; downloading drive network for {PLACES}")
-        G = ox.graph_from_place(PLACES, network_type="drive")
+        G = overpass_retry(ox.graph_from_place, PLACES, network_type="drive")
     return G, (start_pt, end_pt)
 
 
@@ -258,6 +285,7 @@ def main(argv=None):
     ap.add_argument("--observed-source", default=None, help="name of the external source")
     ap.add_argument("--out", default="yeamans_hall_results", help="output folder")
     ap.add_argument("--no-plot", action="store_true")
+    ap.add_argument("--overpass-url", default=None, help="Overpass server to try first")
     # parse_known_args: ignore the extra "-f kernel.json" Jupyter passes when pasted into a cell
     if argv is not None:
         argv = [str(a) for a in argv]  # allow numbers, e.g. ["--start-latlon", 32.9, -79.99]
@@ -266,6 +294,9 @@ def main(argv=None):
     run_date = dt.datetime.now().astimezone()
     ox.settings.use_cache = True
     ox.settings.log_console = False
+    ox.settings.requests_timeout = 300
+    if args.overpass_url:
+        OVERPASS_URLS.insert(0, args.overpass_url.rstrip("/"))
 
     # 1. network ------------------------------------------------------------
     G, (start_pt, end_pt) = download_network(args.buffer_m, args.start_latlon, args.end_latlon)
