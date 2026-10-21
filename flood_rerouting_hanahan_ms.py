@@ -28,9 +28,19 @@ Method
        c. Mitigation priority: reopen each flood zone on its own (pumps,
           barriers, raising the road) and rank zones by the delay and
           stranding they remove.
+       d. Vehicle routing problem (VRP): a fleet based at the school collects
+          residents who need a ride. Capacitated VRP with a mixed fleet,
+          solved with Google OR-Tools:
+            - buses (large, dry roads only),
+            - high-water vehicles (small, can drive flooded roads slowly);
+              only these may serve stranded stops,
+            - every stop has a pickup demand and a boarding time, every route
+              starts and ends at the school and must finish within a time limit,
+            - objective: minimise total fleet driving time; stops that cannot be
+              served are dropped with a large penalty and reported.
 
 Requirements
-    pip install osmnx networkx pandas matplotlib
+    pip install osmnx networkx pandas matplotlib ortools
 
 Usage
     python flood_rerouting_hanahan_ms.py
@@ -40,10 +50,13 @@ Usage
               --school-latlon LAT LON         (default: Hanahan Middle School below)
               --radius-m 4500                 (enlarge the download if a street is missing)
               --flood-circle LAT LON RADIUS_M   (repeatable; adds a flood zone)
+              --buses 3 --bus-capacity 30 --high-water-vehicles 2 --high-water-capacity 10
+              --people-per-stop 8 --vrp-max-route-min 60 --vrp-stops affected|all
 """
 
 import argparse
 import datetime as dt
+import importlib.util
 import json
 import math
 import os
@@ -455,6 +468,278 @@ def plot_map(G, df, loads, flooded, crit_df, school_pt, zones, path, n_detour_la
         display(Image(filename=path, width=900))
 
 
+# --- vehicle routing (pickup fleet) ---------------------------------------------------
+
+def fleet_weight(mode, slowdown):
+    """Edge cost for a fleet type: 'bus' avoids flooded roads, 'hw' drives them slowly."""
+    def w(u, v, dd):
+        costs = []
+        for d in dd.values():
+            if d.get("zone"):
+                if mode == "bus":
+                    continue
+                costs.append(d["t0"] * slowdown)
+            else:
+                costs.append(d["t0"])
+        return min(costs) if costs else None
+    return w
+
+
+def fleet_path_edges(G, path, mode, slowdown):
+    w = fleet_weight(mode, slowdown)
+    out = []
+    for u, v in zip(path[:-1], path[1:]):
+        best = min(((w(u, v, {k: d}), k) for k, d in G[u][v].items() if w(u, v, {k: d}) is not None))
+        out.append((u, v, best[1]))
+    return out
+
+
+def node_street(G, n):
+    """Readable stop name: the streets meeting at an intersection."""
+    names = []
+    for _, _, d in list(G.out_edges(n, data=True)) + list(G.in_edges(n, data=True)):
+        name = first(d.get("name"))
+        if name and name not in names:
+            names.append(name)
+    return " & ".join(names[:2]) if names else f"node {n}"
+
+
+def solve_pickup_vrp(G, depot, stops, demand, stranded, fleet, max_route_s, service_s,
+                     slowdown, time_limit_s, span_cost=10):
+    """Capacitated, mixed-fleet VRP with OR-Tools.
+
+    stops: list of nodes; demand: people per stop; stranded: set of stops only
+    high-water vehicles may serve; fleet: list of {"type": "bus"|"hw", "capacity": int}.
+    Returns (routes, dropped, matrices, paths).
+    """
+    from ortools.constraint_solver import pywrapcp, routing_enums_pb2
+
+    locs = [depot] + list(stops)
+    INF = 10 ** 7
+    mats, paths = {}, {}
+    for mode in {f["type"] for f in fleet}:
+        w = fleet_weight(mode, slowdown)
+        mat = [[0] * len(locs) for _ in locs]
+        pth = {}
+        for i, a in enumerate(locs):
+            t, p = nx.single_source_dijkstra(G, a, weight=w)
+            for j, b in enumerate(locs):
+                if i != j:
+                    mat[i][j] = int(round(t[b])) if b in t else INF
+                    pth[i, j] = p.get(b)
+        mats[mode], paths[mode] = mat, pth
+
+    manager = pywrapcp.RoutingIndexManager(len(locs), len(fleet), 0)
+    routing = pywrapcp.RoutingModel(manager)
+
+    def make_cb(mat):
+        def cb(i, j):
+            a, b = manager.IndexToNode(i), manager.IndexToNode(j)
+            return mat[a][b] + (service_s if a != 0 else 0)
+        return routing.RegisterTransitCallback(cb)
+
+    cb_ids = {mode: make_cb(mat) for mode, mat in mats.items()}
+    for v, f in enumerate(fleet):
+        routing.SetArcCostEvaluatorOfVehicle(cb_ids[f["type"]], v)
+    routing.AddDimensionWithVehicleTransits([cb_ids[f["type"]] for f in fleet], 0, max_route_s, True, "Time")
+    # also penalise the latest return, so the last resident arrives sooner (balanced routes)
+    routing.GetDimensionOrDie("Time").SetGlobalSpanCostCoefficient(span_cost)
+
+    dem = [0] + [int(demand[n]) for n in stops]
+    dem_cb = routing.RegisterUnaryTransitCallback(lambda i: dem[manager.IndexToNode(i)])
+    routing.AddDimensionWithVehicleCapacity(dem_cb, 0, [int(f["capacity"]) for f in fleet], True, "Load")
+
+    hw_ids = [v for v, f in enumerate(fleet) if f["type"] == "hw"]
+    penalty = 100 * max_route_s
+    for j, n in enumerate(stops, start=1):
+        idx = manager.NodeToIndex(j)
+        routing.AddDisjunction([idx], penalty)  # may be dropped (reported) if infeasible
+        if n in stranded:
+            routing.VehicleVar(idx).SetValues([-1] + hw_ids)
+
+    params = pywrapcp.DefaultRoutingSearchParameters()
+    params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
+    params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
+    params.time_limit.FromSeconds(int(time_limit_s))
+    sol = routing.SolveWithParameters(params)
+    if sol is None:
+        return None, list(stops), mats, paths
+
+    time_dim, load_dim = routing.GetDimensionOrDie("Time"), routing.GetDimensionOrDie("Load")
+    routes, served = [], set()
+    for v, f in enumerate(fleet):
+        idx = routing.Start(v)
+        seq = []
+        while True:
+            node = manager.IndexToNode(idx)
+            seq.append((node, sol.Value(time_dim.CumulVar(idx)), sol.Value(load_dim.CumulVar(idx))))
+            if routing.IsEnd(idx):
+                break
+            idx = sol.Value(routing.NextVar(idx))
+        served.update(n for n, _, _ in seq if n != 0)
+        routes.append({"vehicle": v, "type": f["type"], "capacity": f["capacity"], "seq": seq})
+    dropped = [stops[j - 1] for j in range(1, len(locs)) if j not in served]
+    return routes, dropped, mats, paths
+
+
+def run_pickup_vrp(G, df, school, school_pt, flooded, args, out_dir):
+    if importlib.util.find_spec("ortools") is None:
+        print("\n(VRP skipped: OR-Tools not installed. In Jupyter run  %pip install ortools  and restart.)")
+        return None
+    pool = df if args.vrp_stops == "all" else df[df["status"].isin(["rerouted", "stranded"])]
+    if pool.empty:
+        print("\n(VRP skipped: no affected origins; try --vrp-stops all)")
+        return None
+    stops = [int(n) for n in pool["origin_node"]]
+    status = dict(zip(df["origin_node"], df["status"]))
+    stranded = {n for n in stops if status[n] == "stranded"}
+    demand = {n: args.people_per_stop for n in stops}
+    fleet = ([{"type": "bus", "capacity": args.bus_capacity}] * args.buses
+             + [{"type": "hw", "capacity": args.high_water_capacity}] * args.high_water_vehicles)
+    if not fleet:
+        print("\n(VRP skipped: no vehicles)")
+        return None
+    step(f"solving pickup VRP: {len(stops)} stops ({len(stranded)} stranded), "
+         f"{args.buses} buses x {args.bus_capacity}, {args.high_water_vehicles} high-water x "
+         f"{args.high_water_capacity}, {args.vrp_time_limit_s:g} s search")
+    routes, dropped, mats, paths = solve_pickup_vrp(
+        G, school, stops, demand, stranded, fleet, int(args.vrp_max_route_min * 60),
+        int(args.vrp_service_min * 60), args.high_water_slowdown, args.vrp_time_limit_s, args.vrp_balance)
+    if routes is None:
+        print("VRP: no feasible plan found (more vehicles, larger capacity or longer --vrp-max-route-min).")
+        return None
+
+    locs = [school] + stops
+    kind = {"bus": "Bus", "hw": "High-water vehicle"}
+    stop_rows, veh_rows, drawn = [], [], []
+    type_no = {}
+    for r in routes:
+        type_no[r["type"]] = type_no.get(r["type"], 0) + 1
+        name = f"{kind[r['type']]} {type_no[r['type']]}"
+        seq = r["seq"]
+        if len(seq) <= 2:
+            veh_rows.append({"vehicle": name, "stops": 0, "people": 0,
+                             "route_time_min": 0.0, "route_distance_mi": 0.0, "used": False})
+            continue
+        edges = []
+        for (a, _, _), (b, _, _) in zip(seq[:-1], seq[1:]):
+            p = paths[r["type"]][a, b]
+            edges += fleet_path_edges(G, p, r["type"], args.high_water_slowdown)
+        dist = sum(G.edges[e]["length"] for e in edges)
+        through_flood = sum(G.edges[e]["length"] for e in edges if G.edges[e].get("zone"))
+        drawn.append((name, r["type"], edges, [locs[n] for n, _, _ in seq[1:-1]]))
+        for order, (n, t, load) in enumerate(seq[1:-1], start=1):
+            node = locs[n]
+            stop_rows.append({"vehicle": name, "stop_order": order, "origin_node": node,
+                              "location": node_street(G, node),
+                              "lat": G.nodes[node]["y"], "lon": G.nodes[node]["x"],
+                              "status": status[node], "people_picked_up": demand[node],
+                              "on_board_after_stop": load + demand[node],
+                              "arrival_min": round(t / 60, 1)})
+        veh_rows.append({"vehicle": name, "stops": len(seq) - 2, "people": seq[-1][2],
+                         "route_time_min": round(seq[-1][1] / 60, 1),
+                         "route_distance_mi": round(dist / M_PER_MI, 2),
+                         "flooded_road_driven_mi": round(through_flood / M_PER_MI, 2), "used": True})
+    stops_df, veh_df = pd.DataFrame(stop_rows), pd.DataFrame(veh_rows)
+    used = veh_df[veh_df["used"]]
+
+    print("\n=== Pickup fleet plan (VRP, OR-Tools) ===")
+    print(veh_df.drop(columns="used").to_string(index=False))
+    print(f"Served {len(stops) - len(dropped)} of {len(stops)} stops, "
+          f"{int(used['people'].sum())} people; all back at {SCHOOL_NAME} within "
+          f"{used['route_time_min'].max():.1f} min.")
+    if dropped:
+        print(f"NOT served ({len(dropped)} stops): {[node_street(G, n) for n in dropped]}\n  -> add vehicles, raise capacity or "
+              "--vrp-max-route-min, or (for stranded stops) add high-water vehicles.")
+    for name, _, _, nodes in drawn:
+        print(f"  {name}: School -> " + " -> ".join(f"[{i}] {node_street(G, n)}" for i, n in enumerate(nodes, 1))
+              + " -> School")
+
+    stops_df.to_csv(os.path.join(out_dir, "vrp_stop_sequence.csv"), index=False)
+    veh_df.to_csv(os.path.join(out_dir, "vrp_vehicle_summary.csv"), index=False)
+    if not args.no_plot:
+        plot_vrp_map(G, drawn, stops_df, dropped, flooded, school_pt,
+                     os.path.join(out_dir, "vrp_pickup_routes_map.png"))
+    return {"vehicles": veh_df, "stops": stops_df, "dropped": dropped}
+
+
+def plot_vrp_map(G, drawn, stops_df, dropped, flooded, school_pt, path):
+    import matplotlib.pyplot as plt
+    import matplotlib.patheffects as pe
+    from matplotlib.lines import Line2D
+
+    palette = ["#1f77b4", "#2ca02c", "#9467bd", "#8c564b", "#e377c2", "#17becf", "#bcbd22", "#ff7f0e"]
+    fig, ax = plt.subplots(figsize=(11, 10))
+    for u, v, k in G.edges(keys=True):
+        xs, ys = edge_xy(G, u, v, k)
+        ax.plot(xs, ys, color="#d4d4d4", lw=0.7, zorder=1)
+    for e in flooded:
+        xs, ys = edge_xy(G, *e)
+        ax.plot(xs, ys, color="#d62728", lw=5, solid_capstyle="round", zorder=2)
+
+    handles = [Line2D([], [], color="#d62728", lw=5, label="Flooded road")]
+    allx, ally = [school_pt[1]], [school_pt[0]]
+    for i, (name, typ, edges, _) in enumerate(drawn):
+        color = palette[i % len(palette)]
+        style = "--" if typ == "hw" else "-"
+        offset = (i - (len(drawn) - 1) / 2) * 0.00004  # small shift so shared roads stay visible
+        for e in edges:
+            xs, ys = edge_xy(G, *e)
+            ax.plot([x + offset for x in xs], [y + offset for y in ys], color=color, lw=3,
+                    ls=style, alpha=0.85, zorder=3)
+            allx += xs
+            ally += ys
+        grp = stops_df[stops_df["vehicle"] == name]
+        ax.scatter(grp["lon"], grp["lat"], s=130, color=color, edgecolor="black", zorder=5)
+        for _, r in grp.iterrows():
+            ax.text(r["lon"], r["lat"], str(r["stop_order"]), ha="center", va="center", fontsize=7,
+                    color="white", fontweight="bold", zorder=6)
+        n_ppl = int(grp["people_picked_up"].sum())
+        handles.append(Line2D([], [], color=color, lw=3, ls=style, marker="o", markersize=8,
+                              markeredgecolor="black",
+                              label=f"{name}: {len(grp)} stop{'s' * (len(grp) != 1)}, {n_ppl} people"))
+    if dropped:
+        ax.scatter([G.nodes[n]["x"] for n in dropped], [G.nodes[n]["y"] for n in dropped], marker="x",
+                   s=80, color="black", zorder=6)
+        handles.append(Line2D([], [], marker="x", ls="", color="black", markersize=8,
+                              label="Stop not served (fleet too small)"))
+    ax.scatter([school_pt[1]], [school_pt[0]], marker="*", s=450, color="gold", edgecolor="black", zorder=7)
+    ax.annotate(f"{SCHOOL_NAME} (depot)", (school_pt[1], school_pt[0]), xytext=(10, 10),
+                textcoords="offset points", fontsize=9, fontweight="bold", zorder=9,
+                path_effects=[pe.withStroke(linewidth=3, foreground="white")])
+    handles.append(Line2D([], [], marker="*", ls="", color="gold", markeredgecolor="black",
+                          markersize=15, label=f"{SCHOOL_NAME}: start and end of every route"))
+
+    allx += list(stops_df["lon"])
+    ally += list(stops_df["lat"])
+    pad_x = (max(allx) - min(allx)) * 0.12 + 0.002
+    pad_y = (max(ally) - min(ally)) * 0.12 + 0.002
+    ax.set_xlim(min(allx) - pad_x, max(allx) + pad_x)
+    ax.set_ylim(min(ally) - pad_y, max(ally) + pad_y)
+    ax.set_aspect(1 / math.cos(math.radians(school_pt[0])))
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.apply_aspect()
+    # street names on the roads the fleet uses
+    placed, seen = [], set()
+    for _, _, edges, _ in drawn:
+        for e in edges:
+            name = first(G.edges[e].get("name"))
+            if name and name not in seen:
+                seen.add(name)
+                place_label(ax, G, [x for x in edges if first(G.edges[x].get("name")) == name],
+                            name, "#333333", placed, size=7)
+    ax.set_title(f"Pickup fleet routes to {SCHOOL_NAME} during flooding (VRP)\n"
+                 "Numbers = pickup order; solid = bus (dry roads), dashed = high-water vehicle", fontsize=11)
+    fig.legend(handles=handles, loc="lower center", ncol=2, fontsize=8.5, frameon=False)
+    fig.subplots_adjust(bottom=0.16, top=0.93, left=0.02, right=0.98)
+    fig.savefig(path, dpi=200)
+    plt.close(fig)
+    if "ipykernel" in sys.modules:
+        from IPython.display import Image, display
+        display(Image(filename=path, width=900))
+
+
 # --- main --------------------------------------------------------------------------
 
 def main(argv=None):
@@ -473,6 +758,21 @@ def main(argv=None):
     ap.add_argument("--vehicles-per-origin", type=float, default=10,
                     help="vehicles leaving from each origin intersection (congestion model)")
     ap.add_argument("--assign-iterations", type=int, default=8, help="MSA iterations (0 = skip congestion)")
+    ap.add_argument("--no-vrp", action="store_true", help="skip the pickup-fleet VRP")
+    ap.add_argument("--vrp-stops", choices=["affected", "all"], default="affected",
+                    help="pickup stops: rerouted + stranded origins (default) or every origin")
+    ap.add_argument("--people-per-stop", type=int, default=8, help="riders needing pickup at each stop")
+    ap.add_argument("--buses", type=int, default=3)
+    ap.add_argument("--bus-capacity", type=int, default=30)
+    ap.add_argument("--high-water-vehicles", type=int, default=2)
+    ap.add_argument("--high-water-capacity", type=int, default=10)
+    ap.add_argument("--high-water-slowdown", type=float, default=4.0,
+                    help="high-water vehicles take this many times longer on flooded roads")
+    ap.add_argument("--vrp-service-min", type=float, default=2.0, help="boarding time per stop (min)")
+    ap.add_argument("--vrp-max-route-min", type=float, default=60.0, help="longest allowed route (min)")
+    ap.add_argument("--vrp-time-limit-s", type=float, default=15.0, help="solver search time (s)")
+    ap.add_argument("--vrp-balance", type=int, default=10,
+                    help="weight on the latest return time vs total driving (0 = total driving only)")
     ap.add_argument("--out", default="flood_rerouting_results", help="output folder")
     ap.add_argument("--no-plot", action="store_true")
     if argv is not None:
@@ -665,6 +965,10 @@ def main(argv=None):
     if not args.no_plot:
         plot_map(G, df, loads, flooded, crit_df, school_pt, zones,
                  os.path.join(args.out, "flood_rerouting_map.png"))
+
+    # 7. pickup fleet (VRP) ---------------------------------------------------------
+    if not args.no_vrp:
+        run_pickup_vrp(G, df, school, school_pt, flooded, args, args.out)
 
     print(f"\nOutputs written to {os.path.abspath(args.out)}/")
     return df
