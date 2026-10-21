@@ -49,6 +49,7 @@ Usage
     Options:
               --school-latlon LAT LON         (default: Hanahan Middle School below)
               --radius-m 4500                 (enlarge the download if a street is missing)
+              --osm-file map.osm              (use a downloaded OpenStreetMap file, no server needed)
               --flood-circle LAT LON RADIUS_M   (repeatable; adds a flood zone)
               --buses 3 --bus-capacity 30 --high-water-vehicles 2 --high-water-capacity 10
               --people-per-stop 8 --vrp-max-route-min 60 --vrp-stops affected|all
@@ -173,6 +174,28 @@ def download_network(center, radius_m):
     step(f"downloading drive network within {radius_m:.0f} m of ({center[0]:.5f}, {center[1]:.5f}). "
          "This is the slow step (usually 1-5 min the first time, instant once cached).")
     return overpass_retry(ox.graph_from_point, center, dist=radius_m, network_type="drive")
+
+
+DRIVABLE = {
+    "motorway", "motorway_link", "trunk", "trunk_link", "primary", "primary_link",
+    "secondary", "secondary_link", "tertiary", "tertiary_link", "unclassified",
+    "residential", "living_street", "service", "road",
+}
+
+
+def load_osm_file(path):
+    """Drivable network from a downloaded .osm file (exports also hold buildings, footpaths, ...)."""
+    step(f"reading {path}")
+    G = ox.graph_from_xml(path, simplify=False, retain_all=True)
+    G.remove_edges_from([(u, v, k) for u, v, k, d in G.edges(keys=True, data=True)
+                         if first(d.get("highway")) not in DRIVABLE
+                         or first(d.get("access")) in {"no", "private"}
+                         or first(d.get("service")) in {"parking_aisle", "driveway"}])
+    G.remove_nodes_from([n for n in list(G.nodes) if G.degree(n) == 0])
+    if G.number_of_edges() == 0:
+        raise SystemExit(f"No drivable roads found in {path}.")
+    G = ox.simplify_graph(G)
+    return G.subgraph(max(nx.weakly_connected_components(G), key=len)).copy()
 
 
 def add_travel_times_and_capacity(G):
@@ -745,6 +768,8 @@ def plot_vrp_map(G, drawn, stops_df, dropped, flooded, school_pt, path):
 def main(argv=None):
     """argv: list of options, e.g. main(["--vehicles-per-origin", 15]) from a notebook."""
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--osm-file", default=None,
+                    help="downloaded OpenStreetMap .osm file to use instead of downloading")
     ap.add_argument("--radius-m", type=float, default=DOWNLOAD_RADIUS_M,
                     help=f"download roads within this distance of the school (default {DOWNLOAD_RADIUS_M})")
     ap.add_argument("--school-latlon", type=float, nargs=2, metavar=("LAT", "LON"), default=SCHOOL_LATLON,
@@ -795,7 +820,12 @@ def main(argv=None):
 
     # 1. network --------------------------------------------------------------
     school_pt = tuple(args.school_latlon)
-    G = download_network(school_pt, args.radius_m)
+    if args.osm_file:
+        G = load_osm_file(args.osm_file)
+        if min(dist_m(G, n, *school_pt) for n in G.nodes) > 300:
+            print(f"WARNING: {SCHOOL_NAME} is outside {args.osm_file}; export a larger area.")
+    else:
+        G = download_network(school_pt, args.radius_m)
     G = add_travel_times_and_capacity(G)
     step(f"network ready: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
 
