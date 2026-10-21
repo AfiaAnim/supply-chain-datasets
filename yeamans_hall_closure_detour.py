@@ -48,12 +48,15 @@ import pandas as pd
 CORRIDOR = "Yeamans Hall Road"
 START_CROSS = "Brookside Drive"
 END_CROSS = "Dickson Avenue"
-PLACE = "Hanahan, South Carolina, USA"
+PLACES = ["Hanahan, South Carolina, USA", "North Charleston, South Carolina, USA"]
 
 # Geocoder queries, used only to center the download and as a fallback when the
 # street-name lookup on the graph fails.
 START_QUERY = f"{CORRIDOR} & {START_CROSS}, Hanahan, SC, USA"
 END_QUERY = f"{CORRIDOR} & {END_CROSS}, North Charleston, SC, USA"
+STREET_QUERIES = [f"{CORRIDOR}, North Charleston, SC, USA",
+                  f"{START_CROSS}, Hanahan, SC, USA",
+                  f"{END_CROSS}, North Charleston, SC, USA"]
 
 # Fallback free-flow speeds (mph) for highway classes without a maxspeed tag.
 DEFAULT_SPEEDS_MPH = {
@@ -94,30 +97,28 @@ def download_network(buffer_m, start_pt=None, end_pt=None):
     """Drivable network around the corridor, buffered to include detour streets.
 
     start_pt / end_pt are (lat, lon) overrides; otherwise the intersections are
-    geocoded, then the corridor street itself.
+    geocoded. Each street is also geocoded on its own so the download covers all
+    three streets even when an intersection lookup fails.
     """
     start_pt = start_pt or geocode(START_QUERY)
     end_pt = end_pt or geocode(END_QUERY)
     pts = [p for p in (start_pt, end_pt) if p]
-    if not pts:
-        street = geocode(f"{CORRIDOR}, {PLACE}")
-        if street:
-            print(f"Intersections not geocoded; centering on {CORRIDOR}")
-            G = ox.graph_from_point(street, dist=buffer_m + 2000, network_type="drive")
-            return G, (None, None)
+    if len(pts) < 2:
+        for q in STREET_QUERIES:
+            p = geocode(q)
+            print(f"  geocode '{q}': {p if p else 'not found'}")
+            if p:
+                pts.append(p)
     if pts:
         lat = sum(p[0] for p in pts) / len(pts)
         lon = sum(p[1] for p in pts) / len(pts)
-        # half the start-end span plus the buffer
-        half_span = 0.0
-        if len(pts) == 2:
-            half_span = ox.distance.great_circle(*pts[0], *pts[1]) / 2
-        dist = half_span + buffer_m
+        reach = max(ox.distance.great_circle(lat, lon, *p) for p in pts)
+        dist = reach + buffer_m
         print(f"Downloading drive network: center=({lat:.5f}, {lon:.5f}), radius={dist:.0f} m")
         G = ox.graph_from_point((lat, lon), dist=dist, network_type="drive", simplify=True)
     else:
-        print(f"Geocoding failed; downloading drive network for '{PLACE}'")
-        G = ox.graph_from_place(PLACE, network_type="drive")
+        print(f"Geocoding failed; downloading drive network for {PLACES}")
+        G = ox.graph_from_place(PLACES, network_type="drive")
     return G, (start_pt, end_pt)
 
 
@@ -127,25 +128,63 @@ def add_travel_times(G):
     return ox.add_edge_travel_times(G)
 
 
-def intersection_node(G, street_a, street_b, fallback_point=None):
-    """Node where edges named street_a and street_b meet."""
-    a, b = norm(street_a), norm(street_b)
-    touching = {}
+def street_key(street):
+    """Distinctive part of a street name: 'Brookside Drive' -> 'brookside'."""
+    words = norm(street).split()
+    return " ".join(words[:-1]) if len(words) > 1 else words[0]
+
+
+def street_nodes(G, street):
+    """Nodes on edges whose name contains the street's distinctive part."""
+    key = street_key(street)
+    nodes = set()
     for u, v, d in G.edges(data=True):
-        names = edge_names(d)
-        for n in (u, v):
-            touching.setdefault(n, set()).update(names)
-    candidates = [n for n, names in touching.items() if a in names and b in names]
-    if candidates:
-        if len(candidates) > 1 and fallback_point:
+        if any(key in n for n in edge_names(d)):
+            nodes.update((u, v))
+    return nodes
+
+
+def similar_names(G, street):
+    first = street_key(street).split()[0]
+    found = set()
+    for _, _, d in G.edges(data=True):
+        found.update(n for n in edge_names(d) if first in n)
+    return sorted(found)
+
+
+def intersection_node(G, street_a, street_b, fallback_point=None, max_gap_m=150):
+    """Node on street_a where it meets street_b.
+
+    1. a node shared by both streets (true junction);
+    2. otherwise the street_a node closest to any street_b node, if within
+       max_gap_m (covers divided roads / slightly offset junctions in OSM);
+    3. otherwise the node nearest the geocoded/override point.
+    """
+    na, nb = street_nodes(G, street_a), street_nodes(G, street_b)
+    shared = na & nb
+    if shared:
+        cands = sorted(shared)
+        if len(cands) > 1 and fallback_point:
             lat, lon = fallback_point
-            candidates.sort(key=lambda n: ox.distance.great_circle(
+            cands.sort(key=lambda n: ox.distance.great_circle(
                 lat, lon, G.nodes[n]["y"], G.nodes[n]["x"]))
-        return candidates[0], "street-name match on OSM graph"
+        return cands[0], "street-name match on OSM graph"
+    if na and nb:
+        gap, best = min(
+            (ox.distance.great_circle(G.nodes[a]["y"], G.nodes[a]["x"],
+                                      G.nodes[b]["y"], G.nodes[b]["x"]), a)
+            for a in na for b in nb)
+        if gap <= max_gap_m:
+            return best, f"closest {street_a} node to {street_b} ({gap:.0f} m apart)"
     if fallback_point:
         lat, lon = fallback_point
-        return ox.distance.nearest_nodes(G, lon, lat), "nearest node to geocoded point"
-    raise RuntimeError(f"Could not find intersection of {street_a} and {street_b}")
+        return ox.distance.nearest_nodes(G, lon, lat), "nearest node to geocoded/given point"
+    raise RuntimeError(
+        f"Could not find the intersection of {street_a} and {street_b}.\n"
+        f"  Streets in the downloaded network like '{street_a}': {similar_names(G, street_a) or 'none'}\n"
+        f"  Streets in the downloaded network like '{street_b}': {similar_names(G, street_b) or 'none'}\n"
+        "  Fix: right-click the intersection in Google Maps to copy its coordinates and pass them, e.g.\n"
+        "  main(['--start-latlon', LAT, LON, '--end-latlon', LAT, LON])  (or %run ... --start-latlon LAT LON)")
 
 
 def route_stats(G, route):
@@ -176,8 +215,8 @@ def street_sequence(rows):
 
 def corridor_segments(rows):
     """Baseline edges that lie on Yeamans Hall Road (candidates for closure)."""
-    key = norm(CORRIDOR)
-    return [r for r in rows if key in {norm(x) for x in str(r["name"]).split(", ")}]
+    key = street_key(CORRIDOR)
+    return [r for r in rows if any(key in norm(x) for x in str(r["name"]).split(", "))]
 
 
 def close_segment(G, u, v):
@@ -217,6 +256,8 @@ def main(argv=None):
     ap.add_argument("--out", default="yeamans_hall_results", help="output folder")
     ap.add_argument("--no-plot", action="store_true")
     # parse_known_args: ignore the extra "-f kernel.json" Jupyter passes when pasted into a cell
+    if argv is not None:
+        argv = [str(a) for a in argv]  # allow numbers, e.g. ["--start-latlon", 32.9, -79.99]
     args, _ = ap.parse_known_args(argv)
 
     run_date = dt.datetime.now().astimezone()
