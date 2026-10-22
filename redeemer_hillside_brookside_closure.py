@@ -1,9 +1,9 @@
 """
-Simulated closures of Redeemer Drive, Hillside Drive and Brookside Drive
+Simulated closures of Redeemer Road, Hillside Drive and Brookside Drive
 (Hanahan / North Charleston, SC): residents' trips to three schools.
 
 Question
-    If Redeemer Drive, Hillside Drive or Brookside Drive is closed (each on its
+    If Redeemer Road, Hillside Drive or Brookside Drive is closed (each on its
     own, and all three together), how do trips from the surrounding homes change
     for
       - Hanahan High School,
@@ -61,7 +61,7 @@ import networkx as nx
 import osmnx as ox
 import pandas as pd
 
-STREETS = ["Redeemer Drive", "Hillside Drive", "Brookside Drive"]
+STREETS = ["Redeemer Road", "Hillside Drive", "Brookside Drive"]
 AREA_CENTER = (32.905, -80.010)  # Hanahan / Berkeley Hills / Highland Park
 DOWNLOAD_RADIUS_M = 4000
 # Hillside Dr and Brookside Dr lie in Highland Park / Berkeley Hills near Hanahan High and
