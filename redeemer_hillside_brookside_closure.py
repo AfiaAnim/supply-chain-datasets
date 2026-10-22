@@ -1,12 +1,13 @@
 """
 Simulated closures of Redeemer Road, Hillside Drive and Brookside Drive
-(Hanahan / North Charleston, SC): residents' trips to three schools.
+(Hanahan / North Charleston, SC): residents' trips to four schools.
 
 Question
     If Redeemer Road, Hillside Drive or Brookside Drive is closed (each on its
     own, and all three together), how do trips from the surrounding homes change
     for
       - Hanahan High School,
+      - Hanahan Middle School,
       - George R. Fishburne Elementary School,
       - Matilda F. Dunston Elementary School?
     Normal routes are compared with closure routes on travel distance,
@@ -80,9 +81,12 @@ GROUNDS_BUFFER_DEG = 0.00027  # ~30 m: the school's street frontage counts as pa
 POINT_GROUNDS_DEG = 0.0007    # ~75 m: grounds assumed around a school mapped only as a point
 SCHOOLS = [  # label, words that must all appear in the OSM name (lower case)
     ("Hanahan High School", ("hanahan", "high")),
+    ("Hanahan Middle School", ("hanahan", "middle")),
     ("George R. Fishburne Elementary School", ("fishburne",)),
     ("Matilda F. Dunston Elementary School", ("dunston",)),
 ]
+# used when a school is not tagged in the map data (coordinates supplied by the user)
+KNOWN_SCHOOLS = {"Hanahan Middle School": (32.90752, -79.994)}
 MIN_NODES = 150
 
 DEFAULT_SPEEDS_MPH = {
@@ -265,6 +269,10 @@ def find_schools(args, center):
         if hits:
             name, lat, lon, geom = max(hits, key=lambda h: h[3].area)  # prefer the grounds polygon
             out.append({"name": label, "lat": lat, "lon": lon, "geom": geom, "source": f"OSM: '{name}'"})
+        elif label in KNOWN_SCHOOLS:
+            lat, lon = KNOWN_SCHOOLS[label]
+            out.append({"name": label, "lat": lat, "lon": lon, "geom": None,
+                        "source": "known coordinates (not tagged in the map data)"})
         else:
             print(f"WARNING: {label} not found in the map data. Add it with "
                   f'--school "{label}" LAT LON (right-click it in Google Maps to copy them).')
