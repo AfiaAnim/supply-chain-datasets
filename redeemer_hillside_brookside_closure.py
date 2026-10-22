@@ -25,8 +25,16 @@ Method
        Individual driveways are not in the road network.
     4. Schools: found by name in the map data (amenity=school); any school
        not found must be given with --school "Name" LAT LON.
+       Access points: a trip reaches a school at whichever of its entrances is
+       fastest, not at one nearest point. Entrances are where a road on the
+       school grounds (driveway, bus loop, parking lot road) meets the road
+       network; roads inside school grounds are kept even when tagged as
+       private driveways. Fallbacks, reported per school: the intersections
+       along the grounds' street frontage, then the nearest intersection.
+       Entrances can also be given with --access "Name" LAT LON. The run
+       reports which entrance each trip uses and whether a closure blocks one.
     5. For each school, one reverse Dijkstra (fastest free-flow route) with all
-       roads open and one per scenario.
+       roads open and one per scenario, from all of its entrances at once.
     6. Cut-off locations: intersections that lose their two-way connection to
        the main road network in a scenario (e.g. streets whose only way out is
        the closed street).
@@ -46,6 +54,7 @@ Usage
     Options:
       --street "Hillside Drive"            close other streets instead (repeatable)
       --school "Name" LAT LON              school missing from the map data (repeatable)
+      --access "Name" LAT LON              a school entrance (repeatable; overrides detection)
       --resident-radius-m 400              size of the resident area
 """
 
@@ -67,6 +76,8 @@ DOWNLOAD_RADIUS_M = 4000
 # Hillside Dr and Brookside Dr lie in Highland Park / Berkeley Hills near Hanahan High and
 # Fishburne Elementary; export generously so every street and school is inside the map.
 EXPORT_BOX = (32.880, 32.930, -80.040, -79.980)  # min lat, max lat, min lon, max lon
+GROUNDS_BUFFER_DEG = 0.00027  # ~30 m: the school's street frontage counts as part of its grounds
+POINT_GROUNDS_DEG = 0.0007    # ~75 m: grounds assumed around a school mapped only as a point
 SCHOOLS = [  # label, words that must all appear in the OSM name (lower case)
     ("Hanahan High School", ("hanahan", "high")),
     ("George R. Fishburne Elementary School", ("fishburne",)),
@@ -146,14 +157,25 @@ def edge_xy(G, u, v, k):
 
 # --- network ----------------------------------------------------------------------------
 
-def load_osm_file(path):
-    """Drivable network from a downloaded .osm file (exports also hold buildings, footpaths, ...)."""
+def load_osm_file(path, keep_areas=()):
+    """Drivable network from a downloaded .osm file (exports also hold buildings, footpaths, ...).
+
+    Driveways, parking aisles and private roads are dropped, except inside keep_areas
+    (school grounds), where they are how traffic reaches the school.
+    """
+    from shapely.geometry import Point
     step(f"reading {path}")
     G = ox.graph_from_xml(path, simplify=False, retain_all=True)
+
+    def on_grounds(u, v):
+        mid = Point((G.nodes[u]["x"] + G.nodes[v]["x"]) / 2, (G.nodes[u]["y"] + G.nodes[v]["y"]) / 2)
+        return any(a.contains(mid) for a in keep_areas)
+
     G.remove_edges_from([(u, v, k) for u, v, k, d in G.edges(keys=True, data=True)
                          if first(d.get("highway")) not in DRIVABLE
-                         or first(d.get("access")) in {"no", "private"}
-                         or first(d.get("service")) in {"parking_aisle", "driveway"}])
+                         or ((first(d.get("access")) in {"no", "private"}
+                              or first(d.get("service")) in {"parking_aisle", "driveway"})
+                             and not on_grounds(u, v))])
     G.remove_nodes_from([n for n in list(G.nodes) if G.degree(n) == 0])
     if G.number_of_edges() == 0:
         raise SystemExit(f"No drivable roads found in {path}.")
@@ -229,27 +251,62 @@ def find_schools(args, center):
         for _, r in gdf.iterrows():
             if "name" in r and isinstance(r["name"], str):
                 pt = r.geometry.representative_point()
-                found_osm.append((r["name"], pt.y, pt.x))
+                found_osm.append((r["name"], pt.y, pt.x, r.geometry))
     except Exception as e:  # no schools in the data, or server failure
         print(f"  no schools found in the map data ({type(e).__name__})")
     out = []
     for label, keywords in SCHOOLS:
         override = next((v for k, v in given.items() if all(w in k for w in keywords)), None)
         if override:
-            out.append({"name": label, "lat": override[1], "lon": override[2], "source": "given (--school)"})
+            out.append({"name": label, "lat": override[1], "lon": override[2], "geom": None,
+                        "source": "given (--school)"})
             continue
         hits = [s for s in found_osm if all(w in s[0].lower() for w in keywords)]
         if hits:
-            name, lat, lon = hits[0]
-            out.append({"name": label, "lat": lat, "lon": lon, "source": f"OSM: '{name}'"})
+            name, lat, lon, geom = max(hits, key=lambda h: h[3].area)  # prefer the grounds polygon
+            out.append({"name": label, "lat": lat, "lon": lon, "geom": geom, "source": f"OSM: '{name}'"})
         else:
             print(f"WARNING: {label} not found in the map data. Add it with "
                   f'--school "{label}" LAT LON (right-click it in Google Maps to copy them).')
     # any extra --school entries that are not one of the three
     for k, (n, a, b) in given.items():
         if not any(all(w in k for w in kw) for _, kw in SCHOOLS):
-            out.append({"name": n, "lat": a, "lon": b, "source": "given (--school)"})
+            out.append({"name": n, "lat": a, "lon": b, "geom": None, "source": "given (--school)"})
+    for s in out:
+        from shapely.geometry import Point
+        g = s["geom"]
+        s["grounds"] = (g if g is not None and g.area > 0
+                        else Point(s["lon"], s["lat"]).buffer(POINT_GROUNDS_DEG))
     return out
+
+
+def on_grounds(G, e, grounds):
+    """True for a road segment on the school grounds (driveway, bus loop, parking lot road)."""
+    from shapely.geometry import Point
+    xs, ys = edge_xy(G, *e)
+    return grounds.contains(Point(xs[len(xs) // 2], ys[len(ys) // 2]))
+
+
+def school_entrances(G, s, gates):
+    """Nodes where trips reach the school, and how they were found."""
+    from shapely.geometry import Point
+    if gates:
+        return sorted({min(G.nodes, key=lambda n: dist_m(G, n, a, b)) for a, b in gates}), "given (--access)"
+    grounds = s["grounds"]
+    frontage = grounds.buffer(GROUNDS_BUFFER_DEG)
+    near = {n for n in G.nodes if frontage.contains(Point(G.nodes[n]["x"], G.nodes[n]["y"]))}
+
+    # entrance = a node where a road on the grounds meets a road that is not on the grounds
+    entrances = set()
+    for n in near:
+        on = [on_grounds(G, e, grounds) for e in list(G.out_edges(n, keys=True)) + list(G.in_edges(n, keys=True))]
+        if any(on) and not all(on):
+            entrances.add(n)
+    if entrances:
+        return sorted(entrances), "driveway entrances in the map"
+    if near:
+        return sorted(near), "street frontage of the grounds (no driveways in the map)"
+    return [min(G.nodes, key=lambda n: dist_m(G, n, s["lat"], s["lon"]))], "nearest intersection"
 
 
 def similar_streets(G, street):
@@ -293,6 +350,8 @@ def plot_map(G, od, scenario, closed, schools, example, path):
         ax.scatter(grp["lon"], grp["lat"], s=size, color=color, edgecolor="white", linewidth=0.5, zorder=7)
     xs, ys = list(worst["lon"]), list(worst["lat"])
     for s in schools:
+        ax.scatter([G.nodes[n]["x"] for n in s["targets"]], [G.nodes[n]["y"] for n in s["targets"]],
+                   marker="D", s=55, color="gold", edgecolor="black", zorder=8)
         ax.scatter([s["lon"]], [s["lat"]], marker="*", s=380, color="gold", edgecolor="black", zorder=9)
         ax.annotate(s["name"], (s["lon"], s["lat"]), xytext=(9, 9), textcoords="offset points", fontsize=8.5,
                     fontweight="bold", zorder=10, path_effects=[pe.withStroke(linewidth=3, foreground="white")])
@@ -346,6 +405,8 @@ def plot_map(G, od, scenario, closed, schools, example, path):
         Line2D([], [], marker="o", ls="", color="#ff7f0e", label="Resident: at least one school trip longer"),
         Line2D([], [], marker="o", ls="", color="#000000", label="Resident: cannot reach at least one school"),
         Line2D([], [], marker="*", ls="", color="gold", markeredgecolor="black", markersize=15, label="School"),
+        Line2D([], [], marker="D", ls="", color="gold", markeredgecolor="black", markersize=7,
+               label="School access point (entrance)"),
     ]
     c = worst["status"].value_counts()
     ax.set_title(f"Scenario: {scenario['name']}\nResidents: {c.get('longer', 0)} with a longer school trip, "
@@ -371,6 +432,8 @@ def main(argv=None):
                     help=f"street to close (repeatable; default: {', '.join(STREETS)})")
     ap.add_argument("--school", nargs=3, action="append", default=[], metavar=("NAME", "LAT", "LON"),
                     help="school location if it is not in the map data (repeatable)")
+    ap.add_argument("--access", nargs=3, action="append", default=[], metavar=("NAME", "LAT", "LON"),
+                    help="a school entrance, e.g. --access \"Hanahan High School\" 32.91 -80.02 (repeatable)")
     ap.add_argument("--resident-radius-m", type=float, default=400,
                     help="residents = intersections within this distance of a closed street")
     ap.add_argument("--out", default="redeemer_hillside_brookside_results", help="output folder")
@@ -383,8 +446,12 @@ def main(argv=None):
     run_date = dt.datetime.now().astimezone()
     streets = args.street or STREETS
 
-    # 1. network
-    G = load_osm_file(args.osm_file) if args.osm_file else download_network(AREA_CENTER, args.radius_m)
+    # 1. schools (their grounds decide which driveways to keep), then the network
+    schools = find_schools(args, AREA_CENTER)
+    if not schools:
+        raise SystemExit('No schools located; add them with --school "Name" LAT LON.')
+    G = (load_osm_file(args.osm_file, keep_areas=[s["grounds"].buffer(GROUNDS_BUFFER_DEG) for s in schools])
+         if args.osm_file else download_network(AREA_CENTER, args.radius_m))
     G = add_travel_times(G)
     step(f"network ready: {G.number_of_nodes()} intersections, {G.number_of_edges()} road segments")
     if G.number_of_nodes() < MIN_NODES:
@@ -411,59 +478,71 @@ def main(argv=None):
         scenarios.append({"name": "All closed together", "streets": list(street_edges),
                           "edges": [e for es in street_edges.values() for e in es]})
 
-    # 3. residents (same set for every scenario, so results compare) and schools
+    # 3. school access points, then residents (same set for every scenario, so results compare)
+    for s in schools:
+        gates = [(float(a), float(b)) for n, a, b in args.access
+                 if all(w in n.lower() for w in next((kw for lab, kw in SCHOOLS if lab == s["name"]),
+                                                     tuple(s["name"].lower().split())))]
+        s["targets"], s["access_method"] = school_entrances(G, s, gates)
+        gap = min(dist_m(G, n, s["lat"], s["lon"]) for n in s["targets"])
+        print(f"  {s['name']}: ({s['lat']:.5f}, {s['lon']:.5f}) from {s['source']}; "
+              f"{len(s['targets'])} access point(s) from {s['access_method']}:")
+        for n in s["targets"]:
+            print(f"      {node_street(G, n)} ({G.nodes[n]['y']:.5f}, {G.nodes[n]['x']:.5f})")
+        if gap > 300:
+            print(f"  WARNING: {s['name']} is {gap:.0f} m from the nearest road in the map; export a larger area")
+    # roads on school grounds identify the entrances; trips end there, so routes never use them
+    # (a school driveway is not a public cut-through)
+    ground_edges = {e for e in G.edges(keys=True) if any(on_grounds(G, e, sc["grounds"]) for sc in schools)}
+    entrances = {n for sc in schools for n in sc["targets"]}
     nodes_of = {st: {n for e in es for n in e[:2]} for st, es in street_edges.items()}
+    from shapely.geometry import Point
     origins, near_street = [], {}
     for n in G.nodes:
+        if n in entrances or any(sc["grounds"].contains(Point(G.nodes[n]["x"], G.nodes[n]["y"])) for sc in schools):
+            continue  # school entrances and roads on school grounds are not homes
         d_best, st_best = min((min(dist_m(G, m, G.nodes[n]["y"], G.nodes[n]["x"]) for m in ns), st)
                               for st, ns in nodes_of.items())
         if d_best <= args.resident_radius_m:
             origins.append(n)
             near_street[n] = st_best
-    centre = (sum(G.nodes[n]["y"] for n in origins) / len(origins),
-              sum(G.nodes[n]["x"] for n in origins) / len(origins))
-    schools = find_schools(args, centre)
-    if not schools:
-        raise SystemExit('No schools located; add them with --school "Name" LAT LON.')
-    for s in schools:
-        s["node"] = min(G.nodes, key=lambda n: dist_m(G, n, s["lat"], s["lon"]))
-        gap = dist_m(G, s["node"], s["lat"], s["lon"])
-        s["snap_m"] = round(gap)
-        print(f"  {s['name']}: ({s['lat']:.5f}, {s['lon']:.5f}) from {s['source']}, nearest road {gap:.0f} m"
-              + ("  <- WARNING: far from any road in the map; export a larger area" if gap > 300 else ""))
     step(f"{len(origins)} resident origins within {args.resident_radius_m:.0f} m of the streets; "
          f"{len(scenarios)} scenarios x {len(schools)} schools")
 
     # 4. routing: normal once per school, then once per scenario
-    main_before = max(nx.strongly_connected_components(G), key=len)
+    G_public = G.copy()
+    G_public.remove_edges_from(ground_edges)
+    main_before = max(nx.strongly_connected_components(G_public), key=len)
     rows, examples, cut_rows = [], {}, []
     for sc in scenarios:
         blocked = set(sc["edges"])
-        H = G.copy()
+        H = G_public.copy()
         H.remove_edges_from(sc["edges"])
         main_after = max(nx.strongly_connected_components(H), key=len)
         for n in main_before - main_after:
             cut_rows.append({"scenario": sc["name"], "node": n, "location": node_street(G, n),
                              "lat": G.nodes[n]["y"], "lon": G.nodes[n]["x"]})
     for s in schools:
-        t_n, p_n = routes_to(G, [s["node"]], set())
+        t_n, p_n = routes_to(G, s["targets"], ground_edges)
         for sc in scenarios:
             blocked = set(sc["edges"])
-            t_c, p_c = routes_to(G, [s["node"]], blocked)
+            t_c, p_c = routes_to(G, s["targets"], blocked | ground_edges)
             for o in origins:
-                if o not in t_n or o == s["node"]:
+                if o not in t_n or o in s["targets"]:
                     continue  # unreachable even with all roads open (edge of the map)
-                e_n = path_edges(G, p_n[o], set())
+                e_n = path_edges(G, p_n[o], ground_edges)
                 row = {"scenario": sc["name"], "school": s["name"], "origin_node": o,
                        "origin": node_street(G, o), "near_street": near_street[o],
                        "lat": G.nodes[o]["y"], "lon": G.nodes[o]["x"],
                        "uses_closed_street_normally": any(e in blocked for e in e_n),
                        "normal_distance_mi": sum(G.edges[e]["length"] for e in e_n) / M_PER_MI,
-                       "normal_time_min": t_n[o] / 60, "normal_route": street_sequence(G, e_n)}
+                       "normal_time_min": t_n[o] / 60, "normal_route": street_sequence(G, e_n),
+                       "normal_access_point": node_street(G, p_n[o][-1])}
                 if o in t_c:
-                    e_c = path_edges(G, p_c[o], blocked)
+                    e_c = path_edges(G, p_c[o], blocked | ground_edges)
                     row.update(closure_distance_mi=sum(G.edges[e]["length"] for e in e_c) / M_PER_MI,
-                               closure_time_min=t_c[o] / 60, closure_route=street_sequence(G, e_c))
+                               closure_time_min=t_c[o] / 60, closure_route=street_sequence(G, e_c),
+                               closure_access_point=node_street(G, p_c[o][-1]))
                     row["extra_distance_mi"] = row["closure_distance_mi"] - row["normal_distance_mi"]
                     row["extra_time_min"] = row["closure_time_min"] - row["normal_time_min"]
                     row["status"] = "longer" if row["extra_time_min"] > 0.05 else "unchanged"
@@ -524,6 +603,27 @@ def main(argv=None):
             print(f"  {n_cut} location(s) cut off from the road network: "
                   + "; ".join(cut[cut["scenario"] == sc["name"]]["location"].head(8)))
 
+    print("\n=== School access points under each closure ===")
+    acc_rows = []
+    for sc in scenarios:
+        blocked = set(sc["edges"])
+        cut_nodes = set(cut[cut["scenario"] == sc["name"]]["node"]) if len(cut) else set()
+        for s in schools:
+            # blocked = every public road (not on the school grounds) into the access point is closed
+            shut = []
+            for n in s["targets"]:
+                public = [e for e in list(G.in_edges(n, keys=True)) + list(G.out_edges(n, keys=True))
+                          if not on_grounds(G, e, s["grounds"])]
+                if n in cut_nodes or (public and all(e in blocked for e in public)):
+                    shut.append(n)
+            sub = od[(od["scenario"] == sc["name"]) & (od["school"] == s["name"]) & (od["status"] != "unreachable")]
+            moved = int((sub["normal_access_point"] != sub["closure_access_point"]).sum())
+            acc_rows.append({"Scenario": sc["name"], "School": s["name"], "Access points": len(s["targets"]),
+                             "Blocked by closure": len(shut), "Trips switching access point": moved,
+                             "Blocked": "; ".join(node_street(G, n) for n in shut)})
+    access = pd.DataFrame(acc_rows)
+    print(access.to_string(index=False))
+
     print("\n=== Does the impact depend on the street, and on the school? ===")
     by_street = detail.groupby("Scenario", sort=False)[["Trips longer", "Cannot reach", "Max extra time (min)"]] \
         .agg({"Trips longer": "sum", "Cannot reach": "sum", "Max extra time (min)": "max"})
@@ -553,13 +653,17 @@ def main(argv=None):
         table.to_csv(os.path.join(args.out, fname))
     od.to_csv(os.path.join(args.out, "resident_school_routes.csv"), index=False)
     cut.to_csv(os.path.join(args.out, "cut_off_locations.csv"), index=False)
+    access.to_csv(os.path.join(args.out, "school_access_points.csv"), index=False)
     with open(os.path.join(args.out, "run_record.json"), "w") as f:
         json.dump({
             "scenarios": [{"name": sc["name"], "streets": sc["streets"],
                            "closed_segments": len({frozenset(e[:2]) for e in sc["edges"]})} for sc in scenarios],
             "streets_not_found": [st for st in streets if st not in street_edges],
             "residents": f"{len(origins)} intersections within {args.resident_radius_m} m of the streets",
-            "schools": [{k: s[k] for k in ("name", "lat", "lon", "source", "snap_m")} for s in schools],
+            "schools": [{"name": s["name"], "lat": s["lat"], "lon": s["lon"], "source": s["source"],
+                         "access_method": s["access_method"],
+                         "access_points": [{"location": node_street(G, n), "lat": G.nodes[n]["y"],
+                                            "lon": G.nodes[n]["x"]} for n in s["targets"]]} for s in schools],
             "data_source": (f"OpenStreetMap file {args.osm_file}" if args.osm_file else
                             "OpenStreetMap via Overpass API") + f", OSMnx {ox.__version__}",
             "speeds": "OSM maxspeed where tagged, else road-type mean / DEFAULT_SPEEDS_MPH; free flow",
@@ -571,7 +675,7 @@ def main(argv=None):
             plot_map(G, od, sc, sc["edges"], schools, examples.get(sc["name"]),
                      os.path.join(args.out, f"scenario_{i}_{slug}.png"))
     print(f"\nOutputs written to {os.path.abspath(args.out)}/")
-    return detail, pivots, od, cut
+    return detail, pivots, od, cut, access
 
 
 if __name__ == "__main__":
