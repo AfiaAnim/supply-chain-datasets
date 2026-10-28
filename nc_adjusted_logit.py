@@ -5,7 +5,7 @@
 # Needs: %pip install statsmodels
 import numpy as np
 import pandas as pd
-import statsmodels.formula.api as smf
+import patsy
 import statsmodels.api as sm
 from scipy.stats import chi2_contingency
 
@@ -70,6 +70,27 @@ def fmt_p(p):
     return "<0.001" if p < 0.001 else f"{p:.3f}"
 
 
+def label(name):   # "C(GVW_RATING_ID, Treatment(reference='3'))[T.Missing]" -> "GVW_RATING_ID: Missing vs 3"
+    return pd.Series([name]).str.replace(
+        r"C\((\w+)(?:, Treatment\(reference='([^']*)'\))?\)\[T\.(.+)\]",
+        lambda m: f"{m.group(1)}: {m.group(3)} vs {m.group(2) or 'first year'}", regex=True)[0]
+
+
+def drop_aliased(X):
+    """Drop columns that are an exact linear combination of earlier ones (e.g. the 'Missing' level of several
+    vehicle fields marking the very same records). Earlier columns win, so the metro term is always kept."""
+    kept, dropped, A = [], [], np.empty((len(X), 0))
+    for col in X.columns:
+        v = X[col].to_numpy(float)
+        resid = v - A @ np.linalg.lstsq(A, v, rcond=None)[0] if A.shape[1] else v
+        if np.linalg.norm(resid) > 1e-7 * max(np.linalg.norm(v), 1e-12):
+            kept.append(col)
+            A = np.column_stack([A, v])
+        else:
+            dropped.append(col)
+    return X[kept], dropped
+
+
 metro_term = "C(METRO, Treatment(reference='Metro'))"
 metro_coef = f"{metro_term}[T.Nonmetro]"
 models = {
@@ -81,14 +102,19 @@ models = {
 }
 
 groups = pd.factorize(dat["COUNTY_FIPS"])[0]
-fits, rows = {}, []
+fits, rows, aliased = {}, [], {}
 for name, terms in models.items():
-    formula = "fatal ~ " + " + ".join([metro_term] + terms)
-    fit = smf.glm(formula, data=dat, family=sm.families.Binomial()).fit(
-        cov_type="cluster", cov_kwds={"groups": groups})
+    y, X = patsy.dmatrices("fatal ~ " + " + ".join([metro_term] + terms), dat, return_type="dataframe")
+    X, aliased[name] = drop_aliased(X)
+    fit = sm.GLM(y, X, family=sm.families.Binomial()).fit(
+        maxiter=200, cov_type="cluster", cov_kwds={"groups": groups})
+    ok = fit.converged and np.isfinite(fit.params).all() and np.isfinite(fit.bse).all()
+    if not ok:
+        print(f"WARNING: {name} did not converge - do not use its estimates")
     fits[name] = fit
     b, se = fit.params[metro_coef], fit.bse[metro_coef]
     rows.append({"Model": name, "n": int(fit.nobs), "Parameters": len(fit.params),
+                 "Aliased dropped": len(aliased[name]), "Converged": ok,
                  "OR nonmetro vs metro": np.exp(b),
                  "95% CI": f"{np.exp(b - 1.96 * se):.2f}-{np.exp(b + 1.96 * se):.2f}",
                  "p": fmt_p(fit.pvalues[metro_coef])})
@@ -111,6 +137,10 @@ print(f"Unadjusted proportion ratio (nonmetro / metro): {rr:.2f} "
 
 print("\nB. Odds ratios for nonmetro vs metro, logistic regression, county-clustered 95% CIs")
 display(or_table.round(4))
+dropped_full = aliased["5. + environment (full)"]
+if dropped_full:
+    print("Dropped from the full model because they duplicate other columns exactly (no separate estimate "
+          "possible):\n  " + "\n  ".join(label(c) for c in dropped_full))
 
 full = fits["5. + environment (full)"]
 b, se = full.params[metro_coef], full.bse[metro_coef]
@@ -123,9 +153,7 @@ print("The OR compares odds, not proportions. With a fatal share of a few percen
 ci = full.conf_int()
 coefs = pd.DataFrame({"OR": np.exp(full.params), "CI low": np.exp(ci[0]), "CI high": np.exp(ci[1]),
                       "p": full.pvalues}).drop(index="Intercept")
-coefs.index = (coefs.index.str.replace(r"C\((\w+)(?:, Treatment\(reference='([^']*)'\))?\)\[T\.(.+)\]",
-                                       lambda m: f"{m.group(1)}: {m.group(3)} vs {m.group(2) or 'first year'}",
-                                       regex=True))
+coefs.index = [label(c) for c in coefs.index]
 display(coefs.round(3))
 coefs.round(4).to_csv("NC_adjusted_logit_full_model.csv")
 or_table.round(4).to_csv("NC_metro_odds_ratios.csv")

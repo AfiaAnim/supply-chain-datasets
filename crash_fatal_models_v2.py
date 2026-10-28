@@ -92,7 +92,7 @@ print(f"Calendar years spanned (inclusive): {span} | distinct years with data: {
 
 # Is REPORT_DATE the crash date? Crash dates fall on weekends ~25% of the time and come before the record
 # is added to MCMIS; a filing/report date would be mostly weekdays.
-wk = rd.dt.dayofweek
+wk = rd.dt.day_of_week
 print(f"Weekend share of REPORT_DATE: {(wk >= 5).mean():.1%} (crash dates ~25%; office filing dates far lower)")
 t = pd.to_numeric(crash["REPORT_TIME"], errors="coerce")
 print(f"REPORT_TIME between 00:00 and 05:59: {(t < 600).mean():.1%} (crash times include night hours)")
