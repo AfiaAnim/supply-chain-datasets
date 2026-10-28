@@ -36,6 +36,8 @@ TARGET_RECALLS = [0.3, 0.5, 0.7] # operating points for the threshold table
 N_TRIALS = 16                    # XGBoost random-search trials
 N_BOOT = 200                     # bootstrap resamples for confidence intervals
 MIN_CAT_COUNT = 200              # rarer category levels are merged into "infrequent"
+EXTRACT_DATE = "2026-10-26"      # file extract date (from the file name); later years are incomplete
+STUDY_YEARS = None               # None = every full calendar year found in cell 1a; or e.g. range(2010, 2026)
 
 if "crash" not in globals():
     crash = pd.read_csv(PATH, low_memory=False)
@@ -68,6 +70,57 @@ print(f"REPORT_TIME examples: {c['REPORT_TIME'].head(3).tolist()} | invalid HHMM
       f"{(~((t // 100).between(0, 23) & (t % 100).between(0, 59))).mean():.2%}")
 print("\nFatal rate by year:")
 print(fatal_row.groupby(date.dt.year).agg(rows="size", fatal_rate="mean").round(4).to_string())
+
+# %% 1a. Study period: what REPORT_DATE means, which years exist, which are complete
+def parse_any_date(s):
+    """YYYYMMDD numbers (REPORT_DATE, FINAL_STATUS_DATE) or date text such as 15-JAN-24 (ADD_DATE etc.)."""
+    num = pd.to_numeric(s, errors="coerce")
+    if num.notna().mean() > 0.9:
+        return parse_report_date(s)
+    return pd.to_datetime(s, errors="coerce")
+
+
+extract = pd.Timestamp(EXTRACT_DATE)
+rd = parse_report_date(crash["REPORT_DATE"])
+print(f"REPORT_DATE: {rd.min():%Y-%m-%d} to {rd.max():%Y-%m-%d} | unparseable {rd.isna().mean():.2%} | "
+      f"after the extract date {(rd > extract).sum():,}")
+span = rd.dt.year.max() - rd.dt.year.min() + 1
+present = sorted(rd.dt.year.dropna().astype(int).unique())
+gaps = sorted(set(range(present[0], present[-1] + 1)) - set(present))
+print(f"Calendar years spanned (inclusive): {span} | distinct years with data: {len(present)} | "
+      f"years with no records: {gaps or 'none'}")
+
+# Is REPORT_DATE the crash date? Crash dates fall on weekends ~25% of the time and come before the record
+# is added to MCMIS; a filing/report date would be mostly weekdays.
+wk = rd.dt.dayofweek
+print(f"Weekend share of REPORT_DATE: {(wk >= 5).mean():.1%} (crash dates ~25%; office filing dates far lower)")
+t = pd.to_numeric(crash["REPORT_TIME"], errors="coerce")
+print(f"REPORT_TIME between 00:00 and 05:59: {(t < 600).mean():.1%} (crash times include night hours)")
+for col in ["ADD_DATE", "UPLOAD_DATE", "FINAL_STATUS_DATE"]:
+    if col in crash:
+        other = parse_any_date(crash[col])
+        lag = (other - rd).dt.days
+        print(f"{col:18} parsed {other.notna().mean():.1%} | days after REPORT_DATE: median {lag.median():.0f}, "
+              f"95th pct {lag.quantile(0.95):.0f} | REPORT_DATE later than {col}: {(lag < 0).mean():.2%}")
+
+# Completeness by year: months present, records, fatal rate
+yr = pd.DataFrame({"year": rd.dt.year, "month": rd.dt.month, "fatal": crash["FATALITIES"] > 0}).dropna()
+by_year = yr.groupby("year").agg(rows=("fatal", "size"), months=("month", "nunique"), fatal_rate=("fatal", "mean"))
+by_year.index = by_year.index.astype(int)
+median_rows = by_year["rows"].median()
+by_year["status"] = np.select(
+    [by_year.index >= extract.year, by_year["months"] < 12, by_year["rows"] < 0.1 * median_rows],
+    ["incomplete (extract year)", "incomplete (months missing)", "sparse (<10% of median year)"], "full year")
+print(by_year.round(4).to_string())
+
+FULL_YEARS = list(by_year.index[by_year["status"] == "full year"])
+if STUDY_YEARS is not None:
+    FULL_YEARS = [y for y in FULL_YEARS if y in set(STUDY_YEARS)]
+print(f"\nFull years used for analysis and trends: {FULL_YEARS[0]}-{FULL_YEARS[-1]} ({len(FULL_YEARS)} years)")
+print("Excluded:", by_year[~by_year.index.isin(FULL_YEARS)]["status"].to_dict())
+if by_year.loc[FULL_YEARS[-1], "rows"] < 0.8 * by_year.loc[FULL_YEARS[-3:-1], "rows"].mean():
+    print(f"Note: {FULL_YEARS[-1]} has noticeably fewer records than the years before it; late-reported crashes "
+          "may still be arriving. Consider STUDY_YEARS that ends a year earlier.")
 
 # %% 1b. County rural-urban context: 5-digit county FIPS from crash-location STATE + COUNTY_CODE -> RUCC 2023
 # STATE is where the crash happened (never CRASH_CARRIER_STATE, which is the carrier's address).
@@ -152,6 +205,8 @@ d["HOUR"] = (t // 100).where((t // 100).between(0, 23) & (t % 100).between(0, 59
 d["CRASH_STATE"] = d["STATE"]                                     # crash location, not the reporting state
 d["COUNTY"] = d["COUNTY_FIPS"]                                    # 5-digit FIPS from cell 1b
 d["VEHICLES_IN_ACCIDENT"] = d["VEHICLES_IN_ACCIDENT"].clip(upper=10)
+d = d[d["YEAR"].isin(FULL_YEARS)]                                   # full years only (cell 1a)
+print(f"Full years {FULL_YEARS[0]}-{FULL_YEARS[-1]}: {len(d):,} rows")
 
 features = [c for g in GROUPS.values() for c in g]
 categorical = [c for c in features if c not in NUMERIC]
@@ -187,9 +242,8 @@ def group_split(df, test_size, seed):
 
 
 if TEST_MODE == "later_year":
-    years = d["YEAR"].value_counts().sort_index()
-    test_year = years.index[-1] if years.iloc[-1] >= 0.5 * years.iloc[:-1].median() else years.index[-2]
-    test, rest = d[d["YEAR"] == test_year], d[d["YEAR"] < test_year]   # partial last year is skipped
+    test_year = max(FULL_YEARS)                                       # latest full year (cell 1a)
+    test, rest = d[d["YEAR"] == test_year], d[d["YEAR"] < test_year]
     print(f"Test = crashes in {int(test_year)}; model built on earlier years")
 else:
     rest, test = group_split(d, 0.20, SEED)

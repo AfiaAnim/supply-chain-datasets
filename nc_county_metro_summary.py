@@ -1,6 +1,7 @@
 # ===== NC crash counts and fatal-outcome proportions by county and metropolitan status =====
 # Run AFTER cells 1 and 1b of crash_fatal_models_v2.py (uses `crash` with COUNTY_FIPS / RUCC_2023 / METRO,
 # `rucc`, `parse_report_date`, FEDERAL_RECORDABLE_ONLY and DROP_TRANSACTION_CODES).
+# Full calendar years only (FULL_YEARS from cell 1a), so partial years never distort totals or trends.
 # Unit = one crash report (a crash with two trucks counts once); fatal = at least one fatality.
 import numpy as np
 import pandas as pd
@@ -45,10 +46,13 @@ nc["GROUP_ID"] = nc["REPORT_STATE"].astype(str) + "_" + nc["REPORT_NUMBER"].asty
 nc["FATALITIES"] = nc.groupby("GROUP_ID")["FATALITIES"].transform("max")      # crash-level outcome
 nc = nc.sort_values(["GROUP_ID", "REPORT_SEQ_NO"]).drop_duplicates("GROUP_ID", keep="first")
 nc["FATAL"] = (nc["FATALITIES"] > 0).astype(int)
-years = parse_report_date(nc["REPORT_DATE"]).dt.year
-n_years = years.nunique()
+nc["YEAR"] = parse_report_date(nc["REPORT_DATE"]).dt.year
+n_dropped = (~nc["YEAR"].isin(FULL_YEARS)).sum()
+nc = nc[nc["YEAR"].isin(FULL_YEARS)]                                    # full calendar years only (cell 1a)
+n_years = len(FULL_YEARS)
 print(f"NC crash reports: {len(nc):,} | fatal: {nc['FATAL'].sum():,} ({nc['FATAL'].mean():.2%}) | "
-      f"years {int(years.min())}-{int(years.max())} ({n_years} years)")
+      f"full years {FULL_YEARS[0]}-{FULL_YEARS[-1]} ({n_years} years) | "
+      f"excluded from incomplete/sparse/undated years: {n_dropped:,}")
 print(f"Without a matched county: {nc['RUCC_2023'].isna().sum():,} ({nc['RUCC_2023'].isna().mean():.2%})")
 
 # --- 1. Metro vs nonmetro ---
@@ -143,5 +147,30 @@ ax.set_title(f"NC counties: fatal-outcome proportion (hollow = fewer than {MIN_C
              loc="left", color=INK, fontweight="bold", fontsize=10)
 ax.legend(frameon=False, loc="lower right", fontsize=8)
 style(ax)
+plt.tight_layout()
+plt.show()
+
+
+# --- 4. Trend by year (full years only) ---
+trend = summarise(nc, "YEAR")
+display(trend.drop(columns=["ci_lo", "ci_hi"]).round(2))
+trend_m = {s: summarise(nc[nc["METRO"] == s], "YEAR") for s in ("Metro", "Nonmetro")}
+fig, (a1, a2) = plt.subplots(2, 1, figsize=(9, 6.5), sharex=True)
+for status, tb in trend_m.items():
+    c = COLORS[status]
+    a1.plot(tb.index, tb["crashes"], color=c, lw=2, marker="o", ms=4, label=status)
+    a2.fill_between(tb.index, tb["ci_lo"], tb["ci_hi"], color=c, alpha=0.15, lw=0)
+    a2.plot(tb.index, tb["fatal_%"], color=c, lw=2, marker="o", ms=4, label=status)
+a1.set_ylabel("Crash reports", color=INK2)
+a1.set_ylim(bottom=0)
+a2.set_ylabel("Fatal crashes (%), 95% CI", color=INK2)
+a1.set_title(f"NC crashes and fatal-outcome proportion by year, {FULL_YEARS[0]}-{FULL_YEARS[-1]} (full years only)",
+             loc="left", color=INK, fontweight="bold", fontsize=10)
+a1.legend(frameon=False, fontsize=8)
+for a in (a1, a2):
+    a.grid(axis="y", color=GRID, lw=0.6)
+    a.spines[["top", "right", "left"]].set_visible(False)
+    a.spines["bottom"].set_color("#c3c2b7")
+    a.tick_params(colors=INK2, length=0)
 plt.tight_layout()
 plt.show()
