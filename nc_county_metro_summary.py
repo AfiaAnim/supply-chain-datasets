@@ -5,7 +5,7 @@
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from scipy.stats import chi2_contingency, norm
+from scipy.stats import chi2_contingency
 
 MIN_CRASHES = 100      # counties with fewer crashes are flagged: their proportions are unstable
 INK, INK2, MUTED, GRID = "#0b0b0b", "#52514e", "#898781", "#e1e0d9"
