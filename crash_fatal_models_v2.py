@@ -116,6 +116,8 @@ print(by_year.round(4).to_string())
 FULL_YEARS = list(by_year.index[by_year["status"] == "full year"])
 if STUDY_YEARS is not None:
     FULL_YEARS = [y for y in FULL_YEARS if y in set(STUDY_YEARS)]
+if not FULL_YEARS:
+    raise ValueError("No full calendar years found; check REPORT_DATE parsing and STUDY_YEARS (table above).")
 print(f"\nFull years used for analysis and trends: {FULL_YEARS[0]}-{FULL_YEARS[-1]} ({len(FULL_YEARS)} years)")
 print("Excluded:", by_year[~by_year.index.isin(FULL_YEARS)]["status"].to_dict())
 if by_year.loc[FULL_YEARS[-1], "rows"] < 0.8 * by_year.loc[FULL_YEARS[-3:-1], "rows"].mean():
