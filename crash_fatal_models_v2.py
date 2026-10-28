@@ -23,6 +23,7 @@ from xgboost import XGBClassifier
 import shap
 
 PATH = "Crash_File_20261026.csv"
+RUCC_PATH = "Ruralurbancontinuumcodes2023.csv"
 SEED = 42
 UNIT = "report"                  # "report" = one row per crash report; "record" = one row per vehicle record
 FEDERAL_RECORDABLE_ONLY = True   # keep only FEDERAL_RECORDABLE == "Y"
@@ -68,6 +69,36 @@ print(f"REPORT_TIME examples: {c['REPORT_TIME'].head(3).tolist()} | invalid HHMM
 print("\nFatal rate by year:")
 print(fatal_row.groupby(date.dt.year).agg(rows="size", fatal_rate="mean").round(4).to_string())
 
+# %% 1b. County rural-urban context: 5-digit county FIPS from crash-location STATE + COUNTY_CODE -> RUCC 2023
+# STATE is where the crash happened (never CRASH_CARRIER_STATE, which is the carrier's address).
+rucc_long = pd.read_csv(RUCC_PATH, dtype={"FIPS": str}, encoding="latin-1")   # latin-1: accented county names
+rucc = (rucc_long.pivot_table(index=["FIPS", "State", "County_Name"], columns="Attribute", values="Value",
+                              aggfunc="first").reset_index().rename_axis(columns=None))
+rucc["RUCC_2023"] = pd.to_numeric(rucc["RUCC_2023"], errors="coerce").astype("Int64")
+state_fips = rucc.drop_duplicates("State").set_index("State")["FIPS"].str[:2]     # e.g. NC -> "37"
+
+county = pd.to_numeric(crash["COUNTY_CODE"], errors="coerce")
+county = county.where(county.between(1, 999) & (county % 1 == 0))                  # invalid/zero codes -> missing
+st = crash["STATE"].astype("string").str.strip().str.upper()
+crash["COUNTY_FIPS"] = (st.map(state_fips) + county.astype("Int64").astype("string").str.zfill(3)).astype(object)
+crash["COUNTY_FIPS"] = crash["COUNTY_FIPS"].where(crash["COUNTY_FIPS"].notna(), None)
+crash["RUCC_2023"] = crash["COUNTY_FIPS"].map(rucc.set_index("FIPS")["RUCC_2023"])  # map: no copy of the table
+crash["METRO"] = crash["RUCC_2023"].map(lambda r: "Missing" if pd.isna(r) else "Metro" if r <= 3 else "Nonmetro")
+
+built, matched = crash["COUNTY_FIPS"].notna(), crash["RUCC_2023"].notna()
+print(f"Rows: {len(crash):,} | FIPS built: {built.mean():.2%} | matched to RUCC: {matched.mean():.2%} "
+      f"({matched[built].mean():.2%} of rows with a FIPS)")
+print(f"Not built: STATE missing/unknown {(st.isna() | st.map(state_fips).isna()).sum():,} | "
+      f"COUNTY_CODE missing/invalid {county.isna().sum():,}")
+by_state = pd.DataFrame({"rows": built.groupby(st).size(), "match rate": matched[built].groupby(st[built]).mean()})
+print("\nLowest match rates (states with 1,000+ rows):")
+print(by_state[by_state["rows"] >= 1000].sort_values("match rate").head(10).round(4).to_string())
+print("\nMost common unmatched FIPS:", crash.loc[built & ~matched, "COUNTY_FIPS"].value_counts().head(10).to_dict())
+print("North Carolina match rate:", f"{matched[st == 'NC'].mean():.2%}")
+print("\nFatal rate by RUCC 2023:")
+print((crash["FATALITIES"] > 0).groupby(crash["RUCC_2023"].astype("string").fillna("Missing"))
+      .agg(rows="size", fatal_rate="mean").round(4).to_string())
+
 # %% 2. Analysis dataset: clean records, one outcome per unit, more predictors
 GROUPS = {
     "Vehicle": ["TRUCK_BUS_IND", "CARGO_BODY_TYPE_ID", "GVW_RATING_ID", "VEHICLE_CONFIGURATION_ID",
@@ -75,7 +106,7 @@ GROUPS = {
     "Roadway": ["TRAFFICWAY_ID", "ACCESS_CONTROL_ID", "ROAD_SURFACE_CONDITION_ID"],
     "Environment": ["WEATHER_CONDITION_ID", "LIGHT_CONDITION_ID"],
     "Time": ["HOUR", "WEEKDAY", "MONTH"],
-    "Geography": ["CRASH_STATE", "COUNTY"],
+    "Geography": ["CRASH_STATE", "COUNTY", "RUCC_2023", "METRO"],
     "Crash context": ["VEHICLES_IN_ACCIDENT", "N_RECORDS"],
 }
 if INCLUDE_EVENTS:
@@ -88,8 +119,8 @@ INTERACTIONS = [("LIGHT_CONDITION_ID", "TRAFFICWAY_ID"), ("WEATHER_CONDITION_ID"
 # the answer; IDs, VIN, plates, carrier names/addresses and upload fields carry no real signal.
 
 raw_cols = ["CRASH_ID", "REPORT_STATE", "REPORT_NUMBER", "REPORT_SEQ_NO", "REPORT_DATE", "REPORT_TIME",
-            "CHANGE_DATE", "TRANSACTION_CODE", "FEDERAL_RECORDABLE", "FATALITIES", "STATE", "COUNTY_CODE",
-            "VEHICLES_IN_ACCIDENT"] + GROUPS["Vehicle"] + GROUPS["Roadway"] + GROUPS["Environment"] \
+            "CHANGE_DATE", "TRANSACTION_CODE", "FEDERAL_RECORDABLE", "FATALITIES", "STATE", "COUNTY_FIPS",
+            "RUCC_2023", "METRO", "VEHICLES_IN_ACCIDENT"] + GROUPS["Vehicle"] + GROUPS["Roadway"] + GROUPS["Environment"] \
            + (["CRASH_EVENT_SEQ_ID_DESC"] if INCLUDE_EVENTS else [])
 d = crash[raw_cols].copy()
 n0 = len(d)
@@ -118,9 +149,8 @@ d["YEAR"] = date.dt.year
 d["MONTH"] = date.dt.month
 d["WEEKDAY"] = date.dt.day_name().str[:3]
 d["HOUR"] = (t // 100).where((t // 100).between(0, 23) & (t % 100).between(0, 59))
-d["CRASH_STATE"] = d["STATE"].fillna(d["REPORT_STATE"])
-d["COUNTY"] = d["CRASH_STATE"].astype(str) + "_" + pd.to_numeric(d["COUNTY_CODE"], errors="coerce") \
-    .astype("Int64").astype(str).replace("<NA>", "Missing")
+d["CRASH_STATE"] = d["STATE"]                                     # crash location, not the reporting state
+d["COUNTY"] = d["COUNTY_FIPS"]                                    # 5-digit FIPS from cell 1b
 d["VEHICLES_IN_ACCIDENT"] = d["VEHICLES_IN_ACCIDENT"].clip(upper=10)
 
 features = [c for g in GROUPS.values() for c in g]
