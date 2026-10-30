@@ -318,10 +318,12 @@ def school_entrances(G, s, gates):
 
 
 def similar_streets(G, street):
-    """Street names in the map that share the street's first word (spelling help)."""
+    """Street names in the map that look like `street` (spelling help, e.g. Wedgwood/Wedgewood)."""
+    import difflib
     word = norm(street).split()[0]
-    names = {first(d.get("name")) for _, _, d in G.edges(data=True)}
-    return sorted(n for n in names if n and word in norm(n))
+    names = {first(d.get("name")) for _, _, d in G.edges(data=True)} - {None}
+    close = set(difflib.get_close_matches(norm(street), {norm(n): n for n in names}, n=5, cutoff=0.75))
+    return sorted(n for n in names if word in norm(n) or norm(n) in close)
 
 
 # --- map ----------------------------------------------------------------------------------
