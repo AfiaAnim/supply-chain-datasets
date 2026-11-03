@@ -423,7 +423,8 @@ def plot_flow_change(G, edge_of, delta, closed_edges, schools, title, path):
 def main(argv=None):
     """argv: e.g. main(["--osm-file", "map.osm", "--infrarisk-path", "dreaminsg-integrated-model"])."""
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--osm-file", required=False, help="downloaded OpenStreetMap .osm file")
+    ap.add_argument("--osm-file", default=None,
+                    help="downloaded OpenStreetMap .osm file (default: map.osm in the current folder)")
     ap.add_argument("--street", action="append", default=None,
                     help=f"street to close (repeatable; default: {', '.join(base.STREETS)})")
     ap.add_argument("--school", nargs=3, action="append", default=[], metavar=("NAME", "LAT", "LON"))
@@ -443,8 +444,16 @@ def main(argv=None):
     ap.add_argument("--no-plot", action="store_true")
     argv = sys.argv[1:] if argv is None else [str(a) for a in argv]
     args, _ = ap.parse_known_args(argv)
-    if not args.osm_file:
-        raise SystemExit("Give the road map: --osm-file map.osm")
+    if not args.osm_file and os.path.exists("map.osm"):
+        args.osm_file = "map.osm"
+        print(f"Using map.osm from {os.getcwd()}")
+    if not args.osm_file or not os.path.exists(args.osm_file):
+        print(("No road map given. " if not args.osm_file else f"Map file not found: {args.osm_file}. ")
+              + f"Current folder: {os.getcwd()}\n"
+              'Run it with the map file, e.g.\n'
+              '  main(["--osm-file", "map.osm", "--infrarisk-path", "dreaminsg-integrated-model"])\n'
+              '  %run infrarisk_closure_assignment.py --osm-file map.osm --infrarisk-path dreaminsg-integrated-model')
+        return None
     if args.engine == "infrarisk":
         if args.infrarisk_path:
             sys.path.insert(0, os.path.abspath(args.infrarisk_path))
