@@ -63,6 +63,7 @@ MIN_OFFSET_CORR, GOOD_OFFSET_CORR = 0.2, 0.7
 # Performance
 CAL_DEGREE = 3                          # polynomial SEC -> target calibration (3 = S-shaped curve)
 CAL_DECIMATE = 10                       # use every n-th sample for the calibration fits (speed)
+UNIT_SCALE = {"Displacement_m": (1000.0, "mm"), "Force_N": (1.0, "N")}   # errors reported in mm and N
 COHERENCE_BAND_HZ = (0.01, 0.2)         # loading band (40 s cycle = 0.025 Hz and its harmonics)
 
 # FFT / dominant peak
@@ -243,21 +244,35 @@ def calib_xy(tr, c):
     return x, tr["targets"][c][k]
 
 
+def errors_of(y, p, c):
+    """RMSE / MAE / max error in mm or N, and RMSE as % of the target's range."""
+    scale, unit = UNIT_SCALE.get(c, (1.0, ""))
+    e = scale * (p - y)
+    rmse = float(np.sqrt(np.mean(e ** 2)))
+    return {"Unit": unit, "RMSE": rmse, "MAE": float(np.mean(np.abs(e))), "Max error": float(np.max(np.abs(e))),
+            "RMSE (% of range)": 100 * rmse / (scale * (y.max() - y.min()))}
+
+
 def performance(trials):
     pool = [tr for tr in trials if tr["offset_ok"]]      # calibration pool: reliably aligned trials
-    rows, periods = [], []
+    rows, periods, errs = [], [], []
     for tr in trials:
         row = {"Trial": tr["name"], "Alignment |r|": tr["offset_corr"]}
         for c in TARGET_COLS:
             short = c.split("_")[0]
             x, y = calib_xy(tr, c)
             row[f"SEC-{short} |r|"] = abs(np.corrcoef(x, y)[0, 1])
-            row[f"SEC->{short} R2 (own trial)"] = r2(y, np.polyval(np.polyfit(x, y, CAL_DEGREE), x))
+            p_own = np.polyval(np.polyfit(x, y, CAL_DEGREE), x)
+            row[f"SEC->{short} R2 (own trial)"] = r2(y, p_own)
+            errs.append({"Trial": tr["name"], "Target": c, "Calibration": "own trial", **errors_of(y, p_own, c)})
             others = [o for o in pool if o["name"] != tr["name"]]
             if others:
                 xo = np.concatenate([calib_xy(o, c)[0] for o in others])
                 yo = np.concatenate([calib_xy(o, c)[1] for o in others])
-                row[f"SEC->{short} R2 (other trials)"] = r2(y, np.polyval(np.polyfit(xo, yo, CAL_DEGREE), x))
+                p_oth = np.polyval(np.polyfit(xo, yo, CAL_DEGREE), x)
+                row[f"SEC->{short} R2 (other trials)"] = r2(y, p_oth)
+                errs.append({"Trial": tr["name"], "Target": c, "Calibration": "other trials",
+                             **errors_of(y, p_oth, c)})
             nper = max(64, len(tr["x"]) // 4)
             fc, coh = signal.coherence(tr["x"], tr["targets"][c], fs=tr["fs"], nperseg=nper)
             _, pyy = signal.welch(tr["targets"][c], fs=tr["fs"], nperseg=nper)
@@ -276,7 +291,7 @@ def performance(trials):
         prow["SEC matches MTS"] = bool(np.isfinite(ps) and np.isfinite(pd_) and abs(ps - pd_) / pd_ < 0.1)
         rows.append(row)
         periods.append(prow)
-    return pd.DataFrame(rows), pd.DataFrame(periods)
+    return pd.DataFrame(rows), pd.DataFrame(periods), pd.DataFrame(errs)
 
 
 def plot_matrix(perf, periods, out_dir):
@@ -469,9 +484,14 @@ os.makedirs(out_dir, exist_ok=True)
 print("Loading and aligning:")
 trials = [load_pair(*p) for p in find_pairs()]
 
-perf, periods = performance(trials)
+perf, periods, errors = performance(trials)
 print("\nPerformance (MTS = target; R2 'other trials' = SEC calibrated on the other reliable trials):")
 print(perf.round(3).to_string(index=False))
+print("\nErrors in physical units (cubic SEC calibration, whole record):")
+for c in TARGET_COLS:
+    e = errors[errors["Target"] == c]
+    print(f"\n  {c} [{e['Unit'].iloc[0]}]")
+    print(e.drop(columns=["Target", "Unit"]).round(2).to_string(index=False))
 print("\nDominant periods (whole record):")
 print(periods.round(2).to_string(index=False))
 plot_matrix(perf, periods, out_dir)
@@ -488,5 +508,6 @@ xlsx = os.path.join(out_dir, "SEC_MTS_performance.xlsx")
 with pd.ExcelWriter(xlsx, engine="openpyxl") as wr:
     perf.to_excel(wr, sheet_name="Performance", index=False)
     periods.to_excel(wr, sheet_name="Dominant_periods", index=False)
+    errors.to_excel(wr, sheet_name="Errors_physical_units", index=False)
     pd.concat(tracks.values(), ignore_index=True).to_excel(wr, sheet_name="Peak_track", index=False)
 print(f"Saved: {xlsx}")

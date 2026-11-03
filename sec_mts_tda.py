@@ -154,7 +154,8 @@ COMPONENT_COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008
 # FastTDA validation: short, non-overlapping windows (several per 40 s loading cycle), so every
 # window is an (almost) independent data point. Leave-one-trial-out models compare
 #   capacitance  |  + FastTDA  |  + direction (capacitance slope)  |  + direction + FastTDA
-# for displacement and force, and test whether FastTDA tells loading from unloading.
+# for displacement and force, and test whether FastTDA tells loading from unloading. Baselines
+# (cubic, two-branch hysteresis, lagged, random forest) and errors in mm / N are added below.
 VALIDATE = True
 VAL_WINDOWS_S = [4.0, 8.0, 12.0]                # longer windows leave too few windows per trial
 VAL_DELAY_FRACTION = 0.125              # Takens delay = this x window (best of 1/16, 1/8, 1/4 at 8 s)
@@ -162,6 +163,14 @@ VAL_TARGETS = ["Displacement_m:mean", "Force_N:mean"]
 VAL_SKIP_START_S = 40.0                 # drop the first loading cycle (material conditioning)
 VAL_PERMUTATIONS = 1000                 # circular-shift permutation test (respects autocorrelation)
 VAL_RELIABLE_ONLY = True                # use only trials whose SEC-MTS alignment is reliable
+# Baselines and errors in physical units (for a fair test of what FastTDA adds):
+#   cubic calibration (S-curve), two-branch hysteresis calibration (separate curve for capacitance
+#   rising / falling), lagged capacitance (memory of the previous window) and random forests
+#   (flexible model) with and without FastTDA. Errors: RMSE / MAE in mm and N, and RMSE as % of range.
+VAL_BASELINES = True
+VAL_RANDOM_FOREST = True                # needs scikit-learn; skipped with a message if it is missing
+VAL_REPORT_WINDOW_S = 8.0               # window shown in the error / baseline figure
+UNIT_SCALE = {"Displacement_m": (1000.0, "mm"), "Force_N": (1.0, "N")}   # target -> (factor, unit)
 
 
 # ============================================================
@@ -1045,6 +1054,42 @@ BRANCH_MODELS = {
     "Capacitance + direction + FastTDA": VAL_MODELS["Capacitance + direction + FastTDA"],
 }
 MODEL_COLORS = ["#b8b7b2", "#eb6834", "#6da7ec", "#0d366b"]
+CUBIC = ["Cap_mean", "Cap_mean2", "Cap_mean3", "Cap_std"]
+TWO_BRANCH = CUBIC + ["Cap_dir", "Cap_mean_dir", "Cap_mean2_dir"]
+FASTTDA_COLS = ["FastTDA_ZeroInvalid", "FastTDA_FitOK"]
+RF_COLS = ["Cap_mean", "Cap_std", "Cap_slope", "Cap_prev"]
+# Baselines: name -> (model kind, feature columns). "linear" = least squares, "rf" = random forest.
+BASELINE_MODELS = {
+    "Cubic capacitance": ("linear", CUBIC),
+    "Lagged cubic capacitance": ("linear", CUBIC + ["Cap_prev"]),
+    "Two-branch cubic (hysteresis)": ("linear", TWO_BRANCH),
+    "Two-branch cubic + FastTDA": ("linear", TWO_BRANCH + FASTTDA_COLS),
+    "Random forest": ("rf", RF_COLS),
+    "Random forest + FastTDA": ("rf", RF_COLS + FASTTDA_COLS),
+}
+BRANCH_RF_MODELS = {
+    "Random forest": RF_COLS,
+    "Random forest + FastTDA": RF_COLS + FASTTDA_COLS,
+}
+
+
+def have_sklearn():
+    try:
+        import sklearn  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def error_models():
+    """Every model compared in the error table: the four linear models plus the baselines."""
+    models = {m: ("linear", cols) for m, cols in VAL_MODELS.items()}
+    if VAL_BASELINES:
+        rf_ok = VAL_RANDOM_FOREST and have_sklearn()
+        if VAL_RANDOM_FOREST and not rf_ok:
+            print("  scikit-learn not found: random-forest baselines skipped")
+        models.update({m: v for m, v in BASELINE_MODELS.items() if v[0] != "rf" or rf_ok})
+    return models
 
 
 def rank(a):
@@ -1074,27 +1119,59 @@ def circular_perm_p(groups, n_perm, seed=0):
     return (hits + 1) / (n_perm + 1)
 
 
-def loto_fit_predict(frames, target, cols):
-    """Leave-one-trial-out linear model: fit on the other trials, predict the left-out one."""
+def fit_model(kind, X, y, classify=False):
+    """Returns a predict(X) function. linear = least squares with intercept; rf = random forest."""
+    if kind == "rf":
+        from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+        cls = RandomForestClassifier if classify else RandomForestRegressor
+        m = cls(n_estimators=300, min_samples_leaf=3, random_state=0, n_jobs=1).fit(X, y)
+        return (lambda Z: m.predict_proba(Z)[:, 1]) if classify else m.predict
+    beta = np.linalg.lstsq(np.column_stack([np.ones(len(X)), X]), y, rcond=None)[0]
+    return lambda Z: np.column_stack([np.ones(len(Z)), Z]) @ beta
+
+
+def loto_predict(frames, target, cols, kind="linear"):
+    """Leave-one-trial-out: fit on the other trials, predict the left-out one. Lists per trial."""
     pred, true = [], []
     for i, test in enumerate(frames):
         train = pd.concat([f for j, f in enumerate(frames) if j != i])
-        X = np.column_stack([np.ones(len(train))] + [train[c] for c in cols])
-        beta = np.linalg.lstsq(X, train[target].to_numpy(float), rcond=None)[0]
-        Xt = np.column_stack([np.ones(len(test))] + [test[c] for c in cols])
-        pred.append(Xt @ beta)
+        model = fit_model(kind, train[cols].to_numpy(float), train[target].to_numpy(float),
+                          classify=target == "Loading")
+        pred.append(model(test[cols].to_numpy(float)))
         true.append(test[target].to_numpy(float))
+    return pred, true
+
+
+def loto_fit_predict(frames, target, cols, kind="linear"):
+    pred, true = loto_predict(frames, target, cols, kind)
     return np.concatenate(pred), np.concatenate(true)
 
 
-def loto_r2(frames, target, cols):
-    p, t = loto_fit_predict(frames, target, cols)
+def loto_r2(frames, target, cols, kind="linear"):
+    p, t = loto_fit_predict(frames, target, cols, kind)
     return 1 - np.sum((t - p) ** 2) / np.sum((t - t.mean()) ** 2)
 
 
-def loto_accuracy(frames, cols):
-    p, t = loto_fit_predict(frames, "Loading", cols)
+def loto_accuracy(frames, cols, kind="linear"):
+    p, t = loto_fit_predict(frames, "Loading", cols, kind)
     return float(np.mean((p > 0.5) == (t > 0.5)))
+
+
+def loto_errors(frames, target, cols, kind="linear"):
+    """R2 and errors in physical units (mm, N) of the leave-one-trial-out predictions, pooled and
+    per left-out trial."""
+    scale, unit = UNIT_SCALE.get(target.split(":")[0], (1.0, ""))
+    pred, true = loto_predict(frames, target, cols, kind)
+    p, t = scale * np.concatenate(pred), scale * np.concatenate(true)
+    e = p - t
+    per_trial = [float(np.sqrt(np.mean((scale * (a - b)) ** 2))) for a, b in zip(pred, true)]
+    out = {"Unit": unit, "LOTO_R2": float(1 - np.sum(e ** 2) / np.sum((t - t.mean()) ** 2)),
+           "RMSE": float(np.sqrt(np.mean(e ** 2))), "MAE": float(np.mean(np.abs(e))),
+           "Max_abs_error": float(np.max(np.abs(e))),
+           "RMSE_pct_range": float(100 * np.sqrt(np.mean(e ** 2)) / (t.max() - t.min())),
+           "RMSE_trial_mean": float(np.mean(per_trial)), "RMSE_trial_sd": float(np.std(per_trial))}
+    trials = [f["Trial"].iloc[0] for f in frames]
+    return out, dict(zip(trials, per_trial))
 
 
 def short_window_table(tr, window, delay):
@@ -1116,6 +1193,11 @@ def short_window_table(tr, window, delay):
     for c in TARGET_COLS:
         out[f"{c}:mean"], out[f"{c}:std"] = window_stats(tr["targets"][c], window, window)
     f = pd.DataFrame(out)
+    # baseline features: cubic calibration terms, branch (capacitance rising / falling) and memory
+    f["Cap_mean2"], f["Cap_mean3"] = f["Cap_mean"] ** 2, f["Cap_mean"] ** 3
+    f["Cap_dir"] = np.sign(f["Cap_slope"])
+    f["Cap_mean_dir"], f["Cap_mean2_dir"] = f["Cap_mean"] * f["Cap_dir"], f["Cap_mean2"] * f["Cap_dir"]
+    f["Cap_prev"] = f["Cap_mean"].shift(1).fillna(f["Cap_mean"])    # previous window (first: itself)
     return f[f["Time"] >= VAL_SKIP_START_S].reset_index(drop=True)
 
 
@@ -1128,6 +1210,9 @@ def validate(trials, out_dir):
     print(f"\n=== FASTTDA VALIDATION on {', '.join(tr['name'] for tr in use)} "
           f"(non-overlapping windows, first {VAL_SKIP_START_S:g} s dropped) ===")
     r2_rows, feat_rows, branch_rows, all_frames = [], [], [], []
+    err_rows, trial_err_rows = [], []
+    models = error_models()
+    rf_branch = BRANCH_RF_MODELS if any(k == "rf" for k, _ in models.values()) else {}
     for ws in VAL_WINDOWS_S:
         w = int(round(ws * fs))
         d = max(1, int(round(VAL_DELAY_FRACTION * w)))
@@ -1139,6 +1224,12 @@ def validate(trials, out_dir):
             r2 = {m: loto_r2(frames, tgt, cols) for m, cols in VAL_MODELS.items()}
             for m, v in r2.items():
                 r2_rows.append({"Window_s": ws, "Target": tgt, "Model": m, "LOTO_R2": v})
+            for m, (kind, cols) in models.items():
+                err, per_trial = loto_errors(frames, tgt, cols, kind)
+                err_rows.append({"Target": tgt, "Window_s": ws, "Model": m,
+                                 "Uses_FastTDA": "FastTDA" in m, **err})
+                trial_err_rows += [{"Target": tgt, "Window_s": ws, "Model": m, "Left_out_trial": k,
+                                    "Unit": err["Unit"], "RMSE": v} for k, v in per_trial.items()]
             groups = [(f.loc[f["FastTDA"].notna(), "FastTDA"].to_numpy(float),
                        f.loc[f["FastTDA"].notna(), tgt].to_numpy(float)) for f in frames]
             feat_rows.append({
@@ -1158,6 +1249,8 @@ def validate(trials, out_dir):
         row = {"Window_s": ws, "N_windows": len(pooled), "Loading_share": pooled["Loading"].mean()}
         for m, cols in BRANCH_MODELS.items():
             row[f"Accuracy: {m}"] = loto_accuracy(frames, cols)
+        for m, cols in rf_branch.items():
+            row[f"Accuracy: {m}"] = loto_accuracy(frames, cols, "rf")
         branch_rows.append(row)
         print(f"  window {ws:4.1f} s (delay {d / fs:.2f} s): {len(pooled)} windows, "
               f"FastTDA valid {100 * valid.mean():.0f}%")
@@ -1171,8 +1264,17 @@ def validate(trials, out_dir):
     print(feat.round(3).to_string(index=False))
     print("\nLoading vs unloading, leave-one-trial-out accuracy (Loading_share = accuracy of always guessing 'loading'):")
     print(branch.round(3).to_string(index=False))
+    errors = pd.DataFrame(err_rows)
+    print("\nErrors in physical units, leave-one-trial-out (RMSE_trial = mean +- sd over the left-out trials):")
+    for tgt in VAL_TARGETS:
+        e = errors[errors["Target"] == tgt]
+        print(f"\n  {tgt} [{e['Unit'].iloc[0]}]")
+        print(e[["Window_s", "Model", "LOTO_R2", "RMSE", "MAE", "Max_abs_error", "RMSE_pct_range",
+                 "RMSE_trial_mean", "RMSE_trial_sd"]].round(3).to_string(index=False))
     plot_validation(r2_tab, branch, out_dir)
-    return {"Validation_R2": r2_tab.reset_index(), "Validation_FastTDA": feat,
+    plot_errors(errors, out_dir)
+    return {"Validation_R2": r2_tab.reset_index(), "Validation_Errors": errors,
+            "Validation_Errors_PerTrial": pd.DataFrame(trial_err_rows), "Validation_FastTDA": feat,
             "Validation_Branch": branch, "Validation_Windows": pd.concat(all_frames, ignore_index=True)}
 
 
@@ -1189,7 +1291,7 @@ def plot_validation(r2_tab, branch, out_dir):
         ax.set_title(f"{tgt}: leave-one-trial-out R2", fontsize=10, fontweight="bold")
     ax = axes[-1]
     x = np.arange(len(branch))
-    for k, (m, c) in enumerate(zip(BRANCH_MODELS, ["#eb6834", "#b8b7b2", "#6da7ec", "#0d366b"])):
+    for k, (m, c) in enumerate(zip(BRANCH_MODELS, ["#eb6834", "#b8b7b2", "#6da7ec", "#0d366b"])):  # linear only
         ax.bar(x + (k - 1.5) * 0.2, branch[f"Accuracy: {m}"], 0.2, color=c, label=m)
     ax.plot(x, branch["Loading_share"], "_", color="#c0392b", ms=40, mew=2, label="always guess 'loading'")
     ax.set_xticks(x, [f"{w:g} s" for w in branch["Window_s"]])
@@ -1203,6 +1305,36 @@ def plot_validation(r2_tab, branch, out_dir):
     fig.suptitle("FastTDA validation: non-overlapping windows, leave-one-trial-out", fontweight="bold")
     fig.tight_layout()
     png = os.path.join(out_dir, "SEC_MTS_FastTDA_validation.png")
+    fig.savefig(png, dpi=150)
+    print(f"Saved: {png}")
+    plt.show()
+    plt.close(fig)
+
+
+def plot_errors(errors, out_dir):
+    """RMSE in mm / N of every model at VAL_REPORT_WINDOW_S: bar = pooled RMSE, whisker = sd over
+    the left-out trials, label = RMSE and R2. Orange = model uses FastTDA, grey = no TDA."""
+    ws = VAL_REPORT_WINDOW_S if VAL_REPORT_WINDOW_S in set(errors["Window_s"]) else errors["Window_s"].iloc[0]
+    fig, axes = plt.subplots(1, len(VAL_TARGETS), figsize=(6.4 * len(VAL_TARGETS), 4.8), sharey=True)
+    for ax, tgt in zip(np.atleast_1d(axes), VAL_TARGETS):
+        e = errors[(errors["Target"] == tgt) & (errors["Window_s"] == ws)].reset_index(drop=True)
+        y = np.arange(len(e))[::-1]
+        colors = np.where(e["Uses_FastTDA"], "#eb6834", "#8a8984")
+        ax.barh(y, e["RMSE"], color=colors, height=0.65)
+        ax.errorbar(e["RMSE"], y, xerr=e["RMSE_trial_sd"], fmt="none", ecolor="#3d3d3a", lw=1, capsize=3)
+        pad = 0.02 * (e["RMSE"] + e["RMSE_trial_sd"]).max()
+        for yi, r, sd, r2 in zip(y, e["RMSE"], e["RMSE_trial_sd"], e["LOTO_R2"]):
+            ax.text(r + sd + pad, yi, f"{r:.2f}  (R2 {r2:.2f})", va="center", fontsize=8)   # past the whisker
+        ax.set_yticks(y, e["Model"], fontsize=8)
+        ax.set_xlim(0, 1.45 * (e["RMSE"] + e["RMSE_trial_sd"]).max())
+        ax.set_xlabel(f"RMSE ({e['Unit'].iloc[0]}), leave-one-trial-out")
+        ax.set_title(f"{tgt}", fontsize=10, fontweight="bold")
+        ax.grid(axis="x", color="#e4e3df", lw=0.6)
+        ax.spines[["top", "right"]].set_visible(False)
+    fig.suptitle(f"Prediction error in physical units, {ws:g} s windows (orange = uses FastTDA)",
+                 fontweight="bold")
+    fig.tight_layout()
+    png = os.path.join(out_dir, "SEC_MTS_errors_baselines.png")
     fig.savefig(png, dpi=150)
     print(f"Saved: {png}")
     plt.show()
