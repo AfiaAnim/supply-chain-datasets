@@ -15,11 +15,13 @@ Answers the issues a reviewer will raise, using the data already recorded (MTS =
                                          (drift), peak force, hysteresis energy, snap-through position;
                                          cycle-to-cycle and trial-to-trial variation, first-cycle effect
     J4  Too few trials?                  learning curve: error vs number of training trials
+    J5  What is TDA doing?               example windows -> point clouds and fitted ellipses; FastTDA
+                                         vs curvature over time; blind to direction and level
     J0  Which trials are used and why    inclusion table (alignment, record length, loading cycles)
 
 Output (in DATA_DIR/tda_results/journal):
     J1_fasttda_gain_by_window.png, J2_sensitivity_hysteresis.png, J3_repeatability.png,
-    J4_learning_curve.png, SEC_MTS_journal_checks.xlsx
+    J4_learning_curve.png, J5_what_tda_measures.png, SEC_MTS_journal_checks.xlsx
 
 Requirements:
     pip install numpy pandas scipy matplotlib openpyxl scikit-learn
@@ -91,6 +93,11 @@ SNAP_RANGE_MM = (-35.0, -10.0)          # look for the snap-through force dip in
 
 # J4: learning curve
 LEARN_WINDOW_S = 8.0
+
+# J5: what TDA measures (one trial, example windows)
+EXPLAIN_TRIAL = "trial_05"              # None = the first included trial
+EXPLAIN_WINDOW_S = 8.0
+SATURATED_BELOW_MM = -35.0              # windows deeper than this sit where the sensor saturates
 
 COLORS = {"FastTDA": "#eb6834", "curvature": "#2a78d6", "rf": "#0d366b", "base": "#8a8984"}
 TRIAL_CMAP = plt.get_cmap("viridis")
@@ -225,28 +232,41 @@ def point_clouds(x, window, delay, step):
     return np.arange(0, len(x) - window + 1, step), np.stack(cols, axis=2)
 
 
-def fasttda_minor_axis(pc):
-    """SVD-LSE ellipse fit (A + C = 1): minor axis 2b, NaN when the fit is not an ellipse."""
-    X, Y = pc[:, 0] - pc[:, 0].mean(), pc[:, 1] - pc[:, 1].mean()
+def fasttda_fit(pc):
+    """SVD-LSE ellipse fit (A + C = 1) on a 2-D point cloud -> (minor axis 2b, ellipse curve (x, y)),
+    (NaN, None) when the best conic is not an ellipse (e.g. the points lie on a straight line)."""
+    mx, my = pc[:, 0].mean(), pc[:, 1].mean()
+    X, Y = pc[:, 0] - mx, pc[:, 1] - my
     rng = max(np.abs(X).max(), np.abs(Y).max())
     if not np.isfinite(rng) or rng == 0:
-        return np.nan
-    X, Y = X * 1.5 / rng, Y * 1.5 / rng
+        return np.nan, None
+    k = 1.5 / rng
+    X, Y = X * k, Y * k
     G = np.column_stack([X**2 - Y**2, X * Y, X, Y, np.ones_like(X)])
     U, S, Vt = np.linalg.svd(G, full_matrices=False)
     Sinv = np.where(S > np.finfo(float).eps * max(G.shape) * S[0], 1.0 / S, 0.0)
     A, B, D, E, F = (Vt.T * Sinv) @ (U.T @ -(Y**2))
     C = 1.0 - A
     if 4 * A * C - B**2 <= 0:
-        return np.nan
+        return np.nan, None
     th = 0.5 * np.arctan2(B, A - C)
     c, s = np.cos(th), np.sin(th)
     Ap, Cp = A*c*c + B*c*s + C*s*s, A*s*s - B*c*s + C*c*c
     Dp, Ep = D*c + E*s, -D*s + E*c
     if Ap <= 0 or Cp <= 0:
-        return np.nan
+        return np.nan, None
     Fn = F - Dp**2 / (4 * Ap) - Ep**2 / (4 * Cp)
-    return np.nan if Fn >= 0 else 2.0 * min(np.sqrt(-Fn / Ap), np.sqrt(-Fn / Cp))
+    if Fn >= 0:
+        return np.nan, None
+    a_u, a_v = np.sqrt(-Fn / Ap), np.sqrt(-Fn / Cp)
+    u0, v0 = -Dp / (2 * Ap), -Ep / (2 * Cp)
+    t = np.linspace(0, 2 * np.pi, 200)
+    u, v = u0 + a_u * np.cos(t), v0 + a_v * np.sin(t)
+    return 2.0 * min(a_u, a_v), (mx + (c * u - s * v) / k, my + (s * u + c * v) / k)
+
+
+def fasttda_minor_axis(pc):
+    return fasttda_fit(pc)[0]
 
 
 def window_table(tr, ws):
@@ -686,6 +706,178 @@ def plot_learning(lc, out_dir):
 
 
 # ============================================================
+# J5: WHAT IS TDA DOING? (one trial, example windows, FastTDA vs curvature)
+# ============================================================
+
+def scaled(x):
+    """The window as FastTDA sees it: min-max scaled to [-1, 1] (level and size removed)."""
+    lo, hi = x.min(), x.max()
+    return 2 * (x - lo) / (hi - lo) - 1 if hi > lo else np.zeros_like(x)
+
+
+def embed(x, d):
+    return np.column_stack([x[:-d], x[d:]])                     # points (x(t), x(t + tau))
+
+
+def curvature(x, fs):
+    """Quadratic coefficient of a fit to the window (per s^2): how much the window bends."""
+    tt = (np.arange(len(x)) - (len(x) - 1) / 2) / fs
+    return np.polyfit(tt, x, 2)[0]
+
+
+def explain_tda(tr):
+    """Every window (sliding by WINDOW_STEP_S): FastTDA, curvature of the scaled window, and whether
+    the window holds a turnaround of the loading (0 mm or full compression)."""
+    fs = tr["fs"]
+    w, step = int(round(EXPLAIN_WINDOW_S * fs)), max(1, int(round(WINDOW_STEP_S * fs)))
+    d = max(1, int(round(DELAY_FRACTION * w)))
+    disp = 1000 * tr["targets"]["Displacement_m"]
+    cyc = cycles_of(tr)
+    turns = np.array([i for a, pk, b in cyc for i in (a, pk, b)])     # 0 mm and full-compression points
+    rows = []
+    for i in range(0, len(tr["x"]) - w + 1, step):
+        win = tr["x"][i:i + w]
+        two_b, _ = fasttda_fit(embed(scaled(win), d))
+        dd = disp[i:i + w]
+        rows.append({"Trial": tr["name"], "Time_s": tr["t"][i + w // 2], "Displacement_mm": float(dd.mean()),
+                     "Pressing": bool(dd[-1] < dd[0]),
+                     "Holds_turnaround": bool(np.any((turns > i + w * 0.15) & (turns < i + w * 0.85))),
+                     "Saturated": bool(dd.mean() < SATURATED_BELOW_MM),
+                     "FastTDA_2b": two_b, "Fit_ok": bool(np.isfinite(two_b)),
+                     "Curvature_scaled": curvature(scaled(win), fs), "Curvature_raw_pF_s2": curvature(win, fs)})
+    return pd.DataFrame(rows), w, d
+
+
+def example_windows(tr, w):
+    """Five window centres in the 2nd loading cycle: pressing, saturated (flat), full compression,
+    releasing, back at 0 mm."""
+    cyc = cycles_of(tr)
+    a, pk, b = cyc[1] if len(cyc) > 1 else cyc[0]
+    disp = 1000 * tr["targets"]["Displacement_m"]
+    near = lambda lo, hi, target: lo + int(np.argmin(np.abs(disp[lo:hi] - target)))
+    stroke = disp[pk]
+    out = [("pressing (steep part)", near(a, pk, -15.0)),
+           ("pressing, saturated (flat)", near(a, pk, 0.75 * stroke)),
+           ("turnaround at full compression", pk),
+           ("releasing (steep part)", near(pk, b, -15.0)),
+           ("turnaround at 0 mm", b)]
+    return [(label, int(np.clip(c - w // 2, 0, len(disp) - w))) for label, c in out]
+
+
+def plot_explain(tr, ex, w, d, out_dir):
+    fs, t = tr["fs"], tr["t"]
+    disp = 1000 * tr["targets"]["Displacement_m"]
+    examples = example_windows(tr, w)
+    ecol = ["#2a78d6", "#8a8984", "#eb6834", "#1baf7a", "#6250d6"]
+    fig = plt.figure(figsize=(18, 13))
+    gs = fig.add_gridspec(3, 15, height_ratios=[1, 1.15, 1.15], hspace=0.55, wspace=1.2)
+
+    # row 1: the trial with the example windows
+    ax = fig.add_subplot(gs[0, :])
+    ax.plot(t, tr["x"], color="#3d3d3a", lw=1.2, label=f"SEC {SEC_COL}")
+    ax.set_ylabel("Capacitance (pF)")
+    ax2 = ax.twinx()
+    ax2.plot(t, disp, color="#b8b7b2", lw=1.2, ls="--", label="MTS displacement (target)")
+    ax2.set_ylabel("Displacement (mm)")
+    for k, ((label, i0), c) in enumerate(zip(examples, ecol)):
+        ax.axvspan(t[i0], t[i0 + w - 1], color=c, alpha=0.10, lw=0)
+        yk = 1.03 + 0.07 * (k % 2)                                   # staggered: windows may overlap
+        ax.plot([t[i0], t[i0 + w - 1]], [yk, yk], color=c, lw=5, solid_capstyle="butt",
+                transform=ax.get_xaxis_transform(), clip_on=False)
+        ax.text(t[i0 + w // 2], yk + 0.025, str(k + 1), transform=ax.get_xaxis_transform(), ha="center",
+                va="bottom", fontweight="bold", color=c)
+    ax.set_xlabel("Time (s)")
+    ax.set_title(f"{tr['name']}: each {EXPLAIN_WINDOW_S:g} s window (numbered bars) becomes a point cloud below",
+                 fontsize=10, fontweight="bold", pad=34)
+    h1, l1 = ax.get_legend_handles_labels()
+    h2, l2 = ax2.get_legend_handles_labels()
+    ax.legend(h1 + h2, l1 + l2, frameon=False, fontsize=8, loc="lower right")
+
+    # row 2: the point clouds and the fitted ellipses
+    for k, ((label, i0), c) in enumerate(zip(examples, ecol)):
+        ax = fig.add_subplot(gs[1, 3 * k:3 * k + 3])
+        win = tr["x"][i0:i0 + w]
+        pc = embed(scaled(win), d)
+        two_b, ell = fasttda_fit(pc)
+        ax.plot(pc[:, 0], pc[:, 1], ".", color=c, ms=3)
+        if ell is not None:
+            ax.plot(*ell, color="#3d3d3a", lw=1.3)
+        ax.set_xlim(-1.4, 1.4)
+        ax.set_ylim(-1.4, 1.4)
+        ax.set_aspect("equal")
+        ax.set_xlabel("x(t)  (scaled)")
+        if k == 0:
+            ax.set_ylabel(f"x(t + {d / fs:g} s)")
+        val = f"2b = {two_b:.2f}" if np.isfinite(two_b) else "no ellipse (line)"
+        ax.set_title(f"{k + 1}  {label}\n{val};  curvature {curvature(scaled(win), fs):+.3f}",
+                     fontsize=9, fontweight="bold", color=c)
+        ax.grid(color="#e4e3df", lw=0.6)
+
+    # row 3a: FastTDA and curvature over time
+    ax = fig.add_subplot(gs[2, 0:6])
+    norm = lambda v: v / np.nanmax(np.abs(v))
+    ax.plot(ex["Time_s"], norm(ex["FastTDA_2b"]), color=COLORS["FastTDA"], lw=1.5, label="FastTDA 2b")
+    ax.plot(ex["Time_s"], norm(ex["Curvature_scaled"].abs()), color=COLORS["curvature"], lw=1.2,
+            label="|curvature| (no TDA)")
+    bad = ~ex["Fit_ok"]
+    ax.plot(ex["Time_s"][bad], np.full(bad.sum(), -0.08), "|", color="#c0392b", ms=6, label="fit failed (line)")
+    ax2 = ax.twinx()
+    ax2.plot(t, disp, color="#b8b7b2", lw=1, ls="--")
+    ax2.set_ylabel("Displacement (mm)")
+    ax.set_ylim(-0.15, 1.1)
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("scaled to its maximum")
+    ax.set_title("Both rise near the turnarounds of the loading", fontsize=10, fontweight="bold")
+    ax.legend(frameon=False, fontsize=8, loc="upper center", bbox_to_anchor=(0.5, -0.2), ncol=3)
+
+    # row 3b: FastTDA vs curvature
+    ax = fig.add_subplot(gs[2, 7:11])
+    ok = ex["Fit_ok"]
+    sc = ax.scatter(ex.loc[ok, "Curvature_scaled"].abs(), ex.loc[ok, "FastTDA_2b"], c=ex.loc[ok, "Displacement_mm"],
+                    cmap="viridis", s=12)
+    rho = stats.spearmanr(ex.loc[ok, "Curvature_scaled"].abs(), ex.loc[ok, "FastTDA_2b"]).correlation
+    fig.colorbar(sc, ax=ax, label="Displacement (mm)")
+    ax.set_xlabel("|curvature| of the scaled window")
+    ax.set_ylabel("FastTDA 2b")
+    ax.set_title(f"Related, not identical: Spearman rho = {rho:.2f}\n(dark = deep compression: "
+                 f"saturated windows, noise loops)", fontsize=10, fontweight="bold")
+
+    # row 3c: what FastTDA cannot see
+    ax = fig.add_subplot(gs[2, 12:15])
+    i0 = examples[2][1]
+    win = tr["x"][i0:i0 + w]
+    variants = {"original": win, "time-reversed\n(release vs press)": win[::-1],
+                "3x larger,\nshifted": 3 * win + 1.0}
+    vt = [fasttda_fit(embed(scaled(v), d))[0] for v in variants.values()]
+    vc = [curvature(v, fs) for v in variants.values()]
+    x = np.arange(len(variants))
+    ax.bar(x - 0.2, np.array(vt) / vt[0], 0.4, color=COLORS["FastTDA"], label="FastTDA 2b")
+    ax.bar(x + 0.2, np.array(vc) / vc[0], 0.4, color=COLORS["curvature"], label="raw curvature")
+    ax.axhline(1, color="#3d3d3a", lw=0.8)
+    ax.set_xticks(x, list(variants), fontsize=8)
+    ax.set_ylabel("value / original")
+    ax.set_title("FastTDA: blind to direction and level\ncurvature: blind to direction only",
+                 fontsize=10, fontweight="bold")
+    ax.legend(frameon=False, fontsize=8)
+    for a in fig.axes:
+        a.spines[["top"]].set_visible(False)
+    fig.suptitle("J5  What is TDA doing? It measures the loop each window traces: real bends at the "
+                 "turnarounds, amplified noise where the sensor is saturated", fontweight="bold", y=0.985)
+    fig.subplots_adjust(top=0.91, bottom=0.07)
+    save(fig, out_dir, "J5_what_tda_measures.png")
+    return rho
+
+
+def explain_summary(ex):
+    kind = np.where(ex["Holds_turnaround"], "holds a turnaround",
+                    np.where(ex["Saturated"], "saturated (flat, deep compression)", "steady pressing / releasing"))
+    g = ex.assign(Window_type=kind).groupby("Window_type").agg(
+        Windows=("Fit_ok", "size"), Fit_ok_pct=("Fit_ok", lambda v: 100 * v.mean()),
+        Mean_2b=("FastTDA_2b", "mean"), Mean_abs_curvature=("Curvature_scaled", lambda v: v.abs().mean()))
+    return g.reset_index().rename(columns={"Window_type": "Window type"})
+
+
+# ============================================================
 # RUN
 # ============================================================
 
@@ -782,10 +974,26 @@ lc = learning_curve(use)
 print(lc.round(3).to_string(index=False))
 plot_learning(lc, out_dir)
 
+tr5 = next((tr for tr in use if tr["name"] == EXPLAIN_TRIAL), use[0])
+ex, w5, d5 = explain_tda(tr5)
+ex_sum = explain_summary(ex)
+print(f"\nJ5  What TDA measures ({tr5['name']}, {EXPLAIN_WINDOW_S:g} s windows):")
+print(ex_sum.round(3).to_string(index=False))
+rho5 = plot_explain(tr5, ex, w5, d5, out_dir)
+
 answers(inc, gain, sensor, rep, lc)
+t5 = ex_sum.set_index("Window type")
+print("\nJ5  FastTDA turns each window of the SCALED capacitance into a point cloud (x(t), x(t+tau)) and"
+      " measures how fat its loop is:")
+for kind, r in t5.iterrows():
+    print(f"      {kind:36s} fit ok {r['Fit_ok_pct']:3.0f}%, mean 2b {r['Mean_2b']:.2f}")
+print(f"    Straight pressing/releasing -> a line (thin or no ellipse); a turnaround -> a real loop; a saturated"
+      f" window -> the scaling blows up the noise into a loop. Related to curvature (Spearman rho {rho5:.2f}),"
+      f" blind to direction and level.")
 xlsx = os.path.join(out_dir, "SEC_MTS_journal_checks.xlsx")
 with pd.ExcelWriter(xlsx, engine="openpyxl") as wr:
     for sheet, frame in {"J0_Inclusion": inc, "J1_FastTDA_gain": gain, "J2_Sensor": sensor,
-                         "J3_Cycles": cyc, "J3_Repeatability": rep, "J4_Learning_curve": lc}.items():
+                         "J3_Cycles": cyc, "J3_Repeatability": rep, "J4_Learning_curve": lc,
+                         "J5_TDA_windows": ex, "J5_TDA_summary": ex_sum}.items():
         frame.to_excel(wr, sheet_name=sheet, index=False)
 print(f"\nSaved: {xlsx}")
