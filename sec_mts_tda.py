@@ -158,6 +158,10 @@ COMPONENT_COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008
 # (cubic, two-branch hysteresis, lagged, random forest) and errors in mm / N are added below.
 VALIDATE = True
 VAL_WINDOWS_S = [4.0, 8.0, 12.0]                # longer windows leave too few windows per trial
+VAL_STEP_S = 1.0                        # windows slide by this much (None = non-overlapping). Non-overlapping
+                                        # windows whose length divides the 40 s period (4, 8 s) sit at the
+                                        # same few phases of every cycle and flatter the errors; sliding
+                                        # windows cover every phase. Trials stay separate (leave-one-trial-out).
 VAL_DELAY_FRACTION = 0.125              # Takens delay = this x window (best of 1/16, 1/8, 1/4 at 8 s)
 VAL_TARGETS = ["Displacement_m:mean", "Force_N:mean"]
 VAL_SKIP_START_S = 40.0                 # drop the first loading cycle (material conditioning)
@@ -1176,13 +1180,14 @@ def loto_errors(frames, target, cols, kind="linear"):
 
 def short_window_table(tr, window, delay):
     """Non-overlapping windows: FastTDA, capacitance level / spread / slope, targets, loading flag."""
-    starts, clouds = point_clouds(tr["x"], window, delay, False, step=window)
+    step = max(1, int(round(VAL_STEP_S * tr["fs"]))) if VAL_STEP_S else window
+    starts, clouds = point_clouds(tr["x"], window, delay, False, step=step)
     ftda = np.array([fasttda_minor_axis(pc)[0] for pc in clouds])
     idx = np.arange(window) - (window - 1) / 2
     slope = lambda W: (W - W.mean(axis=1, keepdims=True)) @ idx / (idx @ idx) * tr["fs"]   # per s
-    X = sliding_window_view(tr["x"], window)[::window]
-    D = sliding_window_view(tr["targets"]["Displacement_m"], window)[::window]
-    cap_mean, cap_std = window_stats(tr["x"], window, window)
+    X = sliding_window_view(tr["x"], window)[::step]
+    D = sliding_window_view(tr["targets"]["Displacement_m"], window)[::step]
+    cap_mean, cap_std = window_stats(tr["x"], window, step)
     out = {"Trial": tr["name"], "Time": tr["t"][starts + window // 2], "FastTDA": ftda,
            "FastTDA_ZeroInvalid": np.where(np.isfinite(ftda), ftda, 0.0),
            "FastTDA_FitOK": np.isfinite(ftda).astype(float),
@@ -1191,13 +1196,13 @@ def short_window_table(tr, window, delay):
            "Cap_slope": slope(X),                         # direction: capacitance rising or falling
            "Loading": (slope(D) < 0).astype(float)}       # displacement becoming more negative
     for c in TARGET_COLS:
-        out[f"{c}:mean"], out[f"{c}:std"] = window_stats(tr["targets"][c], window, window)
+        out[f"{c}:mean"], out[f"{c}:std"] = window_stats(tr["targets"][c], window, step)
     f = pd.DataFrame(out)
     # baseline features: cubic calibration terms, branch (capacitance rising / falling) and memory
     f["Cap_mean2"], f["Cap_mean3"] = f["Cap_mean"] ** 2, f["Cap_mean"] ** 3
     f["Cap_dir"] = np.sign(f["Cap_slope"])
     f["Cap_mean_dir"], f["Cap_mean2_dir"] = f["Cap_mean"] * f["Cap_dir"], f["Cap_mean2"] * f["Cap_dir"]
-    f["Cap_prev"] = f["Cap_mean"].shift(1).fillna(f["Cap_mean"])    # previous window (first: itself)
+    f["Cap_prev"] = f["Cap_mean"].shift(max(1, window // step)).fillna(f["Cap_mean"])   # the window just before
     return f[f["Time"] >= VAL_SKIP_START_S].reset_index(drop=True)
 
 
@@ -1208,7 +1213,8 @@ def validate(trials, out_dir):
         return None
     fs = use[0]["fs"]
     print(f"\n=== FASTTDA VALIDATION on {', '.join(tr['name'] for tr in use)} "
-          f"(non-overlapping windows, first {VAL_SKIP_START_S:g} s dropped) ===")
+          f"({f'windows sliding by {VAL_STEP_S:g} s' if VAL_STEP_S else 'non-overlapping windows'}, "
+          f"first {VAL_SKIP_START_S:g} s dropped) ===")
     r2_rows, feat_rows, branch_rows, all_frames = [], [], [], []
     err_rows, trial_err_rows = [], []
     models = error_models()
@@ -1302,7 +1308,8 @@ def plot_validation(r2_tab, branch, out_dir):
         ax.grid(axis="y", color="#e4e3df", lw=0.6)
         ax.spines[["top", "right"]].set_visible(False)
         ax.legend(frameon=False, fontsize=7, loc="lower right")
-    fig.suptitle("FastTDA validation: non-overlapping windows, leave-one-trial-out", fontweight="bold")
+    fig.suptitle("FastTDA validation: " + (f"windows sliding by {VAL_STEP_S:g} s" if VAL_STEP_S
+                 else "non-overlapping windows") + ", leave-one-trial-out", fontweight="bold")
     fig.tight_layout()
     png = os.path.join(out_dir, "SEC_MTS_FastTDA_validation.png")
     fig.savefig(png, dpi=150)
