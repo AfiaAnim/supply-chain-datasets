@@ -23,15 +23,24 @@ Steps
        - each trip's pickup is placed in a 2020 census tract and given that tract's share
          of households with no vehicle (ACS 2019-2023 5-year, table B25044).
        - the pickup block group's foot traffic for the trip's month is attached.
-       Then: block group x month table (all 69 block groups of 2010 x FY24 months, trips next to
-       foot traffic), block group summary, and tract summary with vehicle availability.
+       Then: block group x month table (all 69 block groups of 2010 x all 24 foot-traffic
+       months, trips next to foot traffic), block group summary, and tract summary with
+       vehicle availability.
+
+    TWO YEARS OF FOOT TRAFFIC, ONE FISCAL YEAR OF TRIPS
+       The foot-traffic files cover calendar 2023 and 2024 (24 months); the trips cover
+       FY24 only (Jul 2023 - Jun 2024). The 2023_2024 outputs keep all 24 months, with
+       IN_FY24 = True for the 12 months that have trip data; trip columns are blank (not 0)
+       in the other 12 months, because no trips were recorded in this file for them.
 
 Outputs (written to --out-dir)
     rockingham_foot_traffic_2023_2024.csv   step A
-    rockingham_fy24_monthly_merged.csv      step B, months in the FY24 window
+    rockingham_2023_2024_monthly_merged.csv step B, all 24 foot-traffic months + trips (FY24)
+    rockingham_fy24_monthly_merged.csv      step B, the 12 FY24 months only
     rockingham_fy24_trips_clean.csv         FY24 trips with clearly named coords + flags
     rockingham_fy24_trips_enriched.csv      step C: trips + block group, tract, foot traffic, ACS
-    rockingham_fy24_bg_month_merged.csv     step C: block group x month, trips + foot traffic
+    rockingham_2023_2024_bg_month_merged.csv step C: block group x 24 months, trips + foot traffic
+    rockingham_fy24_bg_month_merged.csv     step C: the same, FY24 months only
     rockingham_bg_summary.csv               step C: one row per 2010 block group, FY24
     rockingham_tract_summary.csv            step C: one row per 2020 tract, trips + vehicles
 
@@ -325,23 +334,30 @@ def census_linkage(t, ft):
                 [["ORIG_TRACT2020", "ORIG_TRACT_HOUSEHOLDS", "ORIG_TRACT_NO_VEHICLE_SHARE"]],
                 on="ORIG_TRACT2020", how="left")
 
-    # block group x month (complete grid over FY24 months)
-    months = sorted(e["MONTH_START"].unique())
-    grid = pd.MultiIndex.from_product([sorted(bg["BG2010"]), months], names=["BG2010", "MONTH_START"])
+    # block group x month: complete grid over ALL foot-traffic months (2023 + 2024).
+    # Trip columns are counts (0 = no trips) inside the FY24 window and blank outside it,
+    # because there are no trip records for those months.
+    fy_months = sorted(e["MONTH_START"].unique())
+    all_months = sorted(set(ft["MONTH_START"]) | set(fy_months))
+    grid = pd.MultiIndex.from_product([sorted(bg["BG2010"]), all_months], names=["BG2010", "MONTH_START"])
     out_ = e.groupby(["ORIG_BG2010", "MONTH_START"]).agg(
         TRIPS_FROM=("TRIP_DATE", "size"), HEALTHCARE_TRIPS_FROM=("HEALTHCARE", "sum"),
         TRIPS_FROM_WITH_AID=("RECORDED_AID", "sum"))
     out_.index.names = ["BG2010", "MONTH_START"]
     in_ = e.groupby(["DEST_BG2010", "MONTH_START"]).size().rename("TRIPS_TO")
     in_.index.names = ["BG2010", "MONTH_START"]
-    bgm = out_.join(in_, how="outer").reindex(grid).fillna(0).astype(int).reset_index()
+    bgm = out_.join(in_, how="outer").reindex(grid).reset_index()
+    bgm["IN_FY24"] = bgm["MONTH_START"].isin(fy_months)
+    trip_cols = ["TRIPS_FROM", "HEALTHCARE_TRIPS_FROM", "TRIPS_FROM_WITH_AID", "TRIPS_TO"]
+    bgm.loc[bgm["IN_FY24"], trip_cols] = bgm.loc[bgm["IN_FY24"], trip_cols].fillna(0)
+    bgm[trip_cols] = bgm[trip_cols].astype("Int64")
     ftm = ft.rename(columns={"AREA": "BG2010"})[["BG2010", "MONTH_START", "RAW_DEVICE_COUNTS",
                                                 "RAW_STOP_COUNTS", "DISTANCE_FROM_HOME", "MEDIAN_DWELL"]]
     bgm = bgm.merge(ftm, on=["BG2010", "MONTH_START"], how="left")
     bgm["FT_AVAILABLE"] = bgm["RAW_DEVICE_COUNTS"].notna()
 
     # block group summary over FY24 (+ foot traffic over all 24 months)
-    fy = bgm.groupby("BG2010").agg(
+    fy = bgm[bgm["IN_FY24"]].groupby("BG2010").agg(
         TRIPS_FROM=("TRIPS_FROM", "sum"), TRIPS_TO=("TRIPS_TO", "sum"),
         HEALTHCARE_TRIPS_FROM=("HEALTHCARE_TRIPS_FROM", "sum"),
         TRIPS_FROM_WITH_AID=("TRIPS_FROM_WITH_AID", "sum"),
@@ -403,11 +419,20 @@ def main(argv=None):
           f"{t['TRIP_DATE'].max():%Y-%m-%d}, {bad} with missing/out-of-NC coordinates")
 
     # B
-    m = monthly_foot_traffic(ft).merge(monthly_trips(t), on="MONTH_START", how="inner")
+    mt = monthly_trips(t)
+    m = monthly_foot_traffic(ft).merge(mt, on="MONTH_START", how="inner")
     m = add_calendar(m)
     m.to_csv(out("rockingham_fy24_monthly_merged.csv"), index=False)
-    print(f"[B] monthly merge: {len(m)} months "
+    print(f"[B] monthly merge (FY24 window): {len(m)} months "
           f"({m['MONTH_START'].min():%Y-%m} to {m['MONTH_START'].max():%Y-%m})")
+    # All 24 foot-traffic months (2023 + 2024); trip columns blank outside FY24.
+    m24 = monthly_foot_traffic(ft).merge(mt, on="MONTH_START", how="outer").sort_values("MONTH_START")
+    m24.insert(1, "IN_FY24", m24["MONTH_START"].isin(mt["MONTH_START"]))
+    m24 = add_calendar(m24.reset_index(drop=True))
+    m24.to_csv(out("rockingham_2023_2024_monthly_merged.csv"), index=False)
+    print(f"    all foot-traffic months: {len(m24)} months "
+          f"({m24['MONTH_START'].min():%Y-%m} to {m24['MONTH_START'].max():%Y-%m}), "
+          f"{int(m24['IN_FY24'].sum())} with trip data")
 
     # C
     if args.no_census:
@@ -421,7 +446,8 @@ def main(argv=None):
             e, bgm, bgs, trs = census_linkage(t, ft)
             e.to_csv(out("rockingham_fy24_trips_enriched.csv"), index=False)
             bgm = add_calendar(bgm)
-            bgm.to_csv(out("rockingham_fy24_bg_month_merged.csv"), index=False)
+            bgm.to_csv(out("rockingham_2023_2024_bg_month_merged.csv"), index=False)
+            bgm[bgm["IN_FY24"]].to_csv(out("rockingham_fy24_bg_month_merged.csv"), index=False)
             bgs.to_csv(out("rockingham_bg_summary.csv"), index=False)
             trs.to_csv(out("rockingham_tract_summary.csv"), index=False)
             ok = e["ORIG_COORD_OK"]
