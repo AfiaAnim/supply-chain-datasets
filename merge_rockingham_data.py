@@ -15,32 +15,46 @@ Steps
     B. Aggregate both sources to calendar month and join them on MONTH. Trips are counted
        for the WHOLE month (not just the 1st, which is what Daily_Merged_Transportation_Data
        did).
-    C. Optional, needs a census block group shapefile (--bg-shapefile): place each trip's
-       origin and destination in a block group and join to foot traffic on block group +
-       month. Download for North Carolina:
-       https://www2.census.gov/geo/tiger/TIGER2023/BG/tl_2023_37_bg.zip
-       (requires: pip install geopandas)
+    C. Census linkage (needs geopandas; files are downloaded once from www2.census.gov into
+       CENSUS_DIR and reused):
+       - each trip's pickup and drop-off is placed in a 2010 census block group. The
+         foot-traffic data uses 2010 block groups: all 65 of its IDs exist in 2010, while
+         4 (tract 415, split in 2020) do not exist in 2020/2023 boundaries.
+       - each trip's pickup is placed in a 2020 census tract and given that tract's share
+         of households with no vehicle (ACS 2019-2023 5-year, table B25044).
+       - the pickup block group's foot traffic for the trip's month is attached.
+       Then: block group x month table (all 69 block groups of 2010 x FY24 months, trips next to
+       foot traffic), block group summary, and tract summary with vehicle availability.
 
 Outputs (written to --out-dir)
     rockingham_foot_traffic_2023_2024.csv   step A
     rockingham_fy24_monthly_merged.csv      step B, months in the FY24 window
     rockingham_fy24_trips_clean.csv         FY24 trips with clearly named coords + flags
-    rockingham_fy24_bg_month_merged.csv     step C (only with --bg-shapefile)
+    rockingham_fy24_trips_enriched.csv      step C: trips + block group, tract, foot traffic, ACS
+    rockingham_fy24_bg_month_merged.csv     step C: block group x month, trips + foot traffic
+    rockingham_bg_summary.csv               step C: one row per 2010 block group, FY24
+    rockingham_tract_summary.csv            step C: one row per 2020 tract, trips + vehicles
 
 Usage
     python merge_rockingham_data.py \
         --foot-2024 rockingham_county_data.csv \
         --foot-2023 Rockingham_Foot_Traffic_2023.csv \
         --trips FY24_Geocode_FINAL_Rockingham_for_NCAT.xlsx \
-        --out-dir merged/ [--bg-shapefile tl_2023_37_bg.zip]
+        --out-dir merged/ [--no-census]
 
     In Jupyter: just run the cell. If an input file is not at the path set below, the
     script searches the notebook folder and then your home folder for it by name, so
     names like "FY24_..._NCAT (1).xlsx" are found too. Or pass paths explicitly:
         main(["--trips", "/full/path/to/FY24_Geocode_FINAL_Rockingham_for_NCAT.xlsx"])
 
+NOTES on the foot-traffic data
+    Every row is a Rockingham County block group, but each month holds only a few of
+    them (1 to 18 of 69; most appear in 1-4 of 24 months). Block-group-month foot traffic
+    is therefore missing for most trips (FT_AVAILABLE flags it), and county monthly sums
+    mostly reflect how many block groups were exported that month.
+
 Requirements
-    pip install pandas openpyxl
+    pip install pandas openpyxl geopandas     (geopandas only for step C)
 """
 
 import argparse
@@ -60,6 +74,15 @@ FOOT_2024_PATH = "rockingham_county_data.csv"
 FOOT_2023_PATH = "Rockingham_Foot_Traffic_2023.csv"
 TRIPS_PATH = "FY24_Geocode_FINAL_Rockingham_for_NCAT.xlsx"
 OUT_DIR = "merged"
+CENSUS_DIR = "data/census"        # downloaded census files are cached here
+
+CENSUS = {
+    "bg2010": "https://www2.census.gov/geo/tiger/TIGER2010/BG/2010/tl_2010_37157_bg10.zip",
+    "tract2023": "https://www2.census.gov/geo/tiger/TIGER2023/TRACT/tl_2023_37_tract.zip",
+    "acs_b25044": "https://www2.census.gov/programs-surveys/acs/summary_file/2023/"
+                  "table-based-SF/data/5YRData/acsdt5y2023-b25044.dat",
+}
+STATE_COUNTY = "37157"            # North Carolina, Rockingham County
 
 # Name patterns used to search for a file that is not at the path above.
 SEARCH_PATTERNS = {
@@ -211,32 +234,133 @@ def monthly_trips(t):
 
 
 # ------------------------------------------------------------
-# C. Optional block-group join
+# C. Census linkage
 # ------------------------------------------------------------
-def bg_month_merge(t, ft, shapefile):
+def fetch(key):
+    """Download a census file once into CENSUS_DIR and return its local path."""
+    import urllib.request
+    os.makedirs(CENSUS_DIR, exist_ok=True)
+    path = os.path.join(CENSUS_DIR, os.path.basename(CENSUS[key]))
+    if not os.path.exists(path):
+        print(f"    downloading {CENSUS[key]} ...")
+        tmp = path + ".part"
+        urllib.request.urlretrieve(CENSUS[key], tmp)
+        os.replace(tmp, path)
+    return path
+
+
+def acs_no_vehicle_tracts():
+    """ACS 2019-2023 5-yr B25044 for Rockingham tracts: households, no-vehicle households."""
+    cache = os.path.join(CENSUS_DIR, f"acs2023_b25044_tracts_{STATE_COUNTY}.csv")
+    if os.path.exists(cache):
+        return pd.read_csv(cache, dtype={"TRACT": str})
+    dat = fetch("acs_b25044")
+    prefix = f"1400000US{STATE_COUNTY}"
+    rows = []
+    with open(dat) as fh:
+        header = fh.readline().strip().split("|")
+        for line in fh:
+            if line.startswith(prefix):
+                rows.append(line.strip().split("|"))
+    a = pd.DataFrame(rows, columns=header)
+    num = lambda c: pd.to_numeric(a[c], errors="coerce")
+    out = pd.DataFrame({
+        "TRACT": a["GEO_ID"].str.replace("1400000US", "", regex=False),
+        "HOUSEHOLDS": num("B25044_E001"), "HOUSEHOLDS_MOE": num("B25044_M001"),
+        # no vehicle = owner-occupied (E003) + renter-occupied (E010)
+        "NO_VEHICLE_HH": num("B25044_E003") + num("B25044_E010"),
+        "NO_VEHICLE_HH_MOE": np.sqrt(num("B25044_M003") ** 2 + num("B25044_M010") ** 2),
+    })
+    out["NO_VEHICLE_SHARE"] = out["NO_VEHICLE_HH"] / out["HOUSEHOLDS"]
+    out.to_csv(cache, index=False)
+    os.remove(dat)                                   # the national file is ~60 MB; keep the extract
+    return out
+
+
+def load_polygons():
     import geopandas as gpd
+    bg = gpd.read_file(fetch("bg2010"))
+    bg = bg.rename(columns={"GEOID10": "BG2010"})[["BG2010", "geometry"]].to_crs("EPSG:4326")
+    tr = gpd.read_file(fetch("tract2023"))
+    tr = tr[tr["COUNTYFP"] == STATE_COUNTY[2:]].rename(columns={"GEOID": "TRACT2020"})
+    tr = tr[["TRACT2020", "geometry"]].to_crs("EPSG:4326")
+    return bg, tr
 
-    bg = gpd.read_file(shapefile)[["GEOID", "geometry"]].to_crs("EPSG:4326")
-    out = []
-    for end in ("ORIG", "DEST"):
-        pts = t[t[f"{end}_COORD_OK"]]
-        g = gpd.GeoDataFrame(pts[["MONTH_START"]],
-                             geometry=gpd.points_from_xy(pts[f"{end}_LON"], pts[f"{end}_LAT"]),
-                             crs="EPSG:4326")
-        j = gpd.sjoin(g, bg, how="inner", predicate="within")
-        out.append(j.groupby(["GEOID", "MONTH_START"]).size().rename(f"TRIPS_{end}"))
-    trips_bg = pd.concat(out, axis=1).fillna(0).astype(int).reset_index()
-    trips_bg = trips_bg.rename(columns={"GEOID": "AREA"})
 
-    keep = ["AREA", "MONTH_START", "RAW_DEVICE_COUNTS", "RAW_STOP_COUNTS",
-            "DISTANCE_FROM_HOME", "MEDIAN_DWELL", "ANDROID_DEVICES", "IOS_DEVICES"]
-    m = ft[keep].merge(trips_bg, on=["AREA", "MONTH_START"], how="outer", indicator="MATCH")
-    m["MATCH"] = m["MATCH"].map({"both": "both", "left_only": "foot_traffic_only",
-                                 "right_only": "trips_only"})
-    window = (m["MONTH_START"] >= t["MONTH_START"].min()) & (m["MONTH_START"] <= t["MONTH_START"].max())
-    m = m[window]
-    m[["TRIPS_ORIG", "TRIPS_DEST"]] = m[["TRIPS_ORIG", "TRIPS_DEST"]].fillna(0).astype(int)
-    return m.sort_values(["MONTH_START", "AREA"]).reset_index(drop=True)
+def locate(t, polys, end, idcol):
+    import geopandas as gpd
+    ok = t[f"{end}_COORD_OK"]
+    pts = gpd.GeoDataFrame(index=t.index[ok], geometry=gpd.points_from_xy(
+        t.loc[ok, f"{end}_LON"], t.loc[ok, f"{end}_LAT"]), crs="EPSG:4326")
+    j = gpd.sjoin(pts, polys, how="left", predicate="within")
+    j = j[~j.index.duplicated()]
+    return j[idcol].reindex(t.index)
+
+
+def census_linkage(t, ft):
+    bg, tr = load_polygons()
+    acs = acs_no_vehicle_tracts()
+
+    e = t.copy()
+    e["ORIG_BG2010"] = locate(t, bg, "ORIG", "BG2010")
+    e["DEST_BG2010"] = locate(t, bg, "DEST", "BG2010")
+    e["ORIG_TRACT2020"] = locate(t, tr, "ORIG", "TRACT2020")
+    e["DEST_TRACT2020"] = locate(t, tr, "DEST", "TRACT2020")
+    e["ORIG_IN_COUNTY"] = e["ORIG_BG2010"].notna()
+    e["HEALTHCARE"] = e["TRIP_PURPOSE"].isin(["Dialysis", "Medical"])
+    e["RECORDED_AID"] = e["MOBILITY_AID"].notna()
+
+    # foot traffic of the pickup block group in the trip's month
+    ftc = ft[["AREA", "MONTH_START", "RAW_DEVICE_COUNTS", "RAW_STOP_COUNTS",
+              "DISTANCE_FROM_HOME", "MEDIAN_DWELL"]].rename(columns={
+        "AREA": "ORIG_BG2010", "RAW_DEVICE_COUNTS": "FT_ORIG_DEVICES",
+        "RAW_STOP_COUNTS": "FT_ORIG_STOPS", "DISTANCE_FROM_HOME": "FT_ORIG_DISTANCE_FROM_HOME",
+        "MEDIAN_DWELL": "FT_ORIG_MEDIAN_DWELL"})
+    e = e.merge(ftc, on=["ORIG_BG2010", "MONTH_START"], how="left")
+    e["FT_AVAILABLE"] = e["FT_ORIG_DEVICES"].notna()
+
+    # vehicle availability of the pickup tract
+    e = e.merge(acs.rename(columns={"TRACT": "ORIG_TRACT2020", "NO_VEHICLE_SHARE": "ORIG_TRACT_NO_VEHICLE_SHARE",
+                                    "HOUSEHOLDS": "ORIG_TRACT_HOUSEHOLDS"})
+                [["ORIG_TRACT2020", "ORIG_TRACT_HOUSEHOLDS", "ORIG_TRACT_NO_VEHICLE_SHARE"]],
+                on="ORIG_TRACT2020", how="left")
+
+    # block group x month (complete grid over FY24 months)
+    months = sorted(e["MONTH_START"].unique())
+    grid = pd.MultiIndex.from_product([sorted(bg["BG2010"]), months], names=["BG2010", "MONTH_START"])
+    out_ = e.groupby(["ORIG_BG2010", "MONTH_START"]).agg(
+        TRIPS_FROM=("TRIP_DATE", "size"), HEALTHCARE_TRIPS_FROM=("HEALTHCARE", "sum"),
+        TRIPS_FROM_WITH_AID=("RECORDED_AID", "sum"))
+    out_.index.names = ["BG2010", "MONTH_START"]
+    in_ = e.groupby(["DEST_BG2010", "MONTH_START"]).size().rename("TRIPS_TO")
+    in_.index.names = ["BG2010", "MONTH_START"]
+    bgm = out_.join(in_, how="outer").reindex(grid).fillna(0).astype(int).reset_index()
+    ftm = ft.rename(columns={"AREA": "BG2010"})[["BG2010", "MONTH_START", "RAW_DEVICE_COUNTS",
+                                                "RAW_STOP_COUNTS", "DISTANCE_FROM_HOME", "MEDIAN_DWELL"]]
+    bgm = bgm.merge(ftm, on=["BG2010", "MONTH_START"], how="left")
+    bgm["FT_AVAILABLE"] = bgm["RAW_DEVICE_COUNTS"].notna()
+
+    # block group summary over FY24 (+ foot traffic over all 24 months)
+    fy = bgm.groupby("BG2010").agg(
+        TRIPS_FROM=("TRIPS_FROM", "sum"), TRIPS_TO=("TRIPS_TO", "sum"),
+        HEALTHCARE_TRIPS_FROM=("HEALTHCARE_TRIPS_FROM", "sum"),
+        TRIPS_FROM_WITH_AID=("TRIPS_FROM_WITH_AID", "sum"),
+        FT_MONTHS_IN_FY24=("FT_AVAILABLE", "sum"))
+    ftall = ft.groupby("AREA").agg(FT_MONTHS_2023_2024=("MONTH_START", "nunique"),
+                                   FT_MEAN_DEVICES=("RAW_DEVICE_COUNTS", "mean"),
+                                   FT_MEAN_STOPS=("RAW_STOP_COUNTS", "mean"),
+                                   FT_MEAN_MEDIAN_DWELL=("MEDIAN_DWELL", "mean"))
+    bgs = fy.join(ftall).fillna({"FT_MONTHS_2023_2024": 0}).reset_index()
+    bgs["FT_MONTHS_2023_2024"] = bgs["FT_MONTHS_2023_2024"].astype(int)
+
+    # tract summary with vehicle availability
+    trs = e.groupby("ORIG_TRACT2020").agg(
+        TRIPS_FROM=("TRIP_DATE", "size"), HEALTHCARE_TRIPS_FROM=("HEALTHCARE", "sum"),
+        TRIPS_FROM_WITH_AID=("RECORDED_AID", "sum"))
+    trs = acs.rename(columns={"TRACT": "TRACT2020"}).set_index("TRACT2020").join(trs).fillna(
+        {"TRIPS_FROM": 0, "HEALTHCARE_TRIPS_FROM": 0, "TRIPS_FROM_WITH_AID": 0}).reset_index()
+    trs["TRIPS_FROM_PER_100_HH"] = 100 * trs["TRIPS_FROM"] / trs["HOUSEHOLDS"]
+    return e, bgm, bgs, trs
 
 
 # ------------------------------------------------------------
@@ -256,7 +380,7 @@ def main(argv=None):
     ap.add_argument("--foot-2023", default=FOOT_2023_PATH)
     ap.add_argument("--trips", default=TRIPS_PATH)
     ap.add_argument("--out-dir", default=OUT_DIR)
-    ap.add_argument("--bg-shapefile", help="census block group shapefile (.zip or .shp)")
+    ap.add_argument("--no-census", action="store_true", help="skip step C (census linkage)")
     args, _ = ap.parse_known_args(argv)
 
     args.foot_2024 = find_file(args.foot_2024, SEARCH_PATTERNS["foot_2024"], "2024 foot traffic")
@@ -286,13 +410,29 @@ def main(argv=None):
           f"({m['MONTH_START'].min():%Y-%m} to {m['MONTH_START'].max():%Y-%m})")
 
     # C
-    if args.bg_shapefile:
-        bgm = add_calendar(bg_month_merge(t, ft, args.bg_shapefile))
-        bgm.to_csv(out("rockingham_fy24_bg_month_merged.csv"), index=False)
-        print(f"[C] block-group/month merge: {len(bgm)} rows; "
-              + ", ".join(f"{k}={v}" for k, v in bgm["MATCH"].value_counts().items()))
+    if args.no_census:
+        print("[C] skipped (--no-census)")
     else:
-        print("[C] skipped (pass --bg-shapefile to join on block group + month)")
+        try:
+            import geopandas  # noqa: F401
+        except ImportError:
+            print("[C] skipped: needs geopandas (in Jupyter: %pip install geopandas, restart, re-run)")
+        else:
+            e, bgm, bgs, trs = census_linkage(t, ft)
+            e.to_csv(out("rockingham_fy24_trips_enriched.csv"), index=False)
+            bgm = add_calendar(bgm)
+            bgm.to_csv(out("rockingham_fy24_bg_month_merged.csv"), index=False)
+            bgs.to_csv(out("rockingham_bg_summary.csv"), index=False)
+            trs.to_csv(out("rockingham_tract_summary.csv"), index=False)
+            ok = e["ORIG_COORD_OK"]
+            print(f"[C] trips with pickup in a Rockingham block group: {e['ORIG_IN_COUNTY'].sum():,} "
+                  f"of {ok.sum():,} with valid coordinates")
+            print(f"    trips whose pickup block group has foot traffic that month: "
+                  f"{e['FT_AVAILABLE'].sum():,} ({100 * e['FT_AVAILABLE'].mean():.1f}%)")
+            print(f"    block group x month: {len(bgm):,} rows; {bgm['FT_AVAILABLE'].sum()} with foot traffic, "
+                  f"{(bgm['FT_AVAILABLE'] & (bgm['TRIPS_FROM'] > 0)).sum()} with both")
+            print(f"    tracts: {len(trs)}; no-vehicle share {trs['NO_VEHICLE_SHARE'].min():.1%} "
+                  f"to {trs['NO_VEHICLE_SHARE'].max():.1%}")
 
     print(f"\nOutputs in: {os.path.abspath(args.out_dir)}")
 
