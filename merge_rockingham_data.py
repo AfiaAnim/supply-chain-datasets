@@ -189,14 +189,16 @@ def add_calendar(df):
     return df
 
 
-def main():
+def main(argv=None):
+    """argv: list of options, e.g. ["--out-dir", "merged"]. None reads the command line.
+    Unknown options (like the "-f kernel.json" Jupyter adds) are ignored."""
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--foot-2024", default="rockingham_county_data.csv")
     ap.add_argument("--foot-2023", default="Rockingham_Foot_Traffic_2023.csv")
     ap.add_argument("--trips", default="FY24_Geocode_FINAL_Rockingham_for_NCAT.xlsx")
     ap.add_argument("--out-dir", default="merged")
     ap.add_argument("--bg-shapefile", help="census block group shapefile (.zip or .shp)")
-    args = ap.parse_args()
+    args, _ = ap.parse_known_args(argv)
     os.makedirs(args.out_dir, exist_ok=True)
     out = lambda name: os.path.join(args.out_dir, name)
 
