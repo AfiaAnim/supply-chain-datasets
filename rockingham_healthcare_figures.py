@@ -116,6 +116,9 @@ TOWNS = {"Reidsville": (36.354, -79.664), "Eden": (36.488, -79.767),
          "Greensboro": (36.073, -79.792), "Winston-Salem": (36.100, -80.244),
          "Danville VA": (36.586, -79.395)}
 
+# Label placement for close towns: (latitude offset, vertical alignment)
+TOWN_LABEL_OFFSET = {"Mayodan": (0.012, "bottom"), "Madison": (-0.012, "top")}
+
 # Palette: validated categorical slots 1-2, one-hue blue sequential ramp, neutral inks.
 C = {"Dialysis": "#2a78d6", "Other medical": "#eb6834",
      "surface": "#fcfcfb", "ink": "#0b0b0b", "ink2": "#52514e", "muted": "#8a8986",
@@ -274,9 +277,14 @@ def draw_context(ax, counties, home_name="Rockingham", towns=True):
         for ring in polys:
             ax.plot(ring[:, 0], ring[:, 1], color=C["outline"] if name != home_name else C["ink2"],
                     lw=0.6 if name != home_name else 1.2, zorder=1)
+    import matplotlib.patheffects as pe
+    halo = [pe.withStroke(linewidth=3, foreground=C["surface"])]
     for town, (lat, lon) in (TOWNS.items() if towns else []):
-        ax.text(lon, lat + 0.012, town, fontsize=7, color=C["muted"], ha="center", va="bottom",
-                zorder=5, clip_on=True)
+        dy, va = TOWN_LABEL_OFFSET.get(town, (0.012, "bottom"))
+        ax.scatter([lon], [lat], s=14, color=C["ink"], edgecolor=C["surface"], linewidth=1,
+                   zorder=9, clip_on=True)
+        ax.text(lon, lat + dy, town, fontsize=8.5, fontweight="bold", color=C["ink"], ha="center",
+                va=va, zorder=9, clip_on=True, path_effects=halo)
 
 
 def draw_clinics(ax, sites):
@@ -464,7 +472,7 @@ def fig1_tracts(cb, sites, counties, out_png, out_csv):
         ax.text(pt.x, pt.y, f"{r['CLINIC_BOUND_PICKUPS']:,}", ha="center", va="center", fontsize=7.5,
                 fontweight="bold", color=C["ink"], zorder=8,
                 bbox=dict(boxstyle="round,pad=0.2", fc=C["surface"], ec="none", alpha=0.85))
-    draw_context(ax, counties, towns=False)
+    draw_context(ax, counties, towns=True)
     draw_clinics(ax, sites)
     ax.set_title("Clinic-bound pickups by census tract (6 largest labelled)", loc="left")
     ax.text(0, -0.13, f"{int(t['CLINIC_BOUND_PICKUPS'].sum()):,} clinic-bound trip legs in {len(t)} tracts; "
