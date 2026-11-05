@@ -11,8 +11,9 @@ Healthcare transportation in Rockingham County, FY2024: five report figures.
            and the links learned from the data shown differently.
     Fig 4  Estimated probability of a recorded mobility aid, dialysis vs other medical:
            posterior medians, 95% credible intervals, observed counts.
-    Fig 5  Where to review accessible service: weekday x pickup-area heatmap of
-           clinic-bound trips, with recorded-aid counts in well-populated cells.
+    Fig 5  Where to review accessible service: pickup census tract x weekday heatmap of
+           clinic-bound trips, with recorded-aid counts in well-populated cells (pickup areas
+           if census tracts are unavailable).
 
 DEFINITIONS (read before quoting numbers)
     Healthcare trip      TRIP_PURPOSE "Dialysis" or "Medical" ("Other medical" below).
@@ -39,7 +40,12 @@ UNCERTAINTY (Fig 4)
     as independent, but the same riders travel many times, so it is too narrow.
     Repeat-rider check: a Bayesian bootstrap over pickup locations (a stand-in for
     riders: a home may hold several riders, and a rider may move). Its interval is the
-    more honest one to quote.
+    more honest one to quote, and Fig 4 shows it as the main interval.
+
+MODEL CHECK (Fig 3 note, fig3_model_check.csv)
+    Held-out pickup locations: the full network vs purpose only vs the overall rate, by
+    AUC and log loss. If the full network does no better than purpose only, its extra
+    links describe repeat riders rather than patterns that carry over to new riders.
 
 VEHICLE AVAILABILITY (Fig 1 right)
     ACS 2019-2023 5-year table B25044: households with no vehicle (owner + renter) / all
@@ -431,19 +437,39 @@ def acs_no_vehicle():
     return acs
 
 
-def fig1_tracts(cb, sites, counties, out_png, out_csv):
+def load_tracts():
     import geopandas as gpd
-    from matplotlib.colors import LinearSegmentedColormap, Normalize
     tr = gpd.read_file(census_file(TRACTS_URL))
     tr = tr[tr["COUNTYFP"] == STATE_COUNTY[2:]][["GEOID", "geometry"]].rename(columns={"GEOID": "TRACT"})
     tr = tr.to_crs("EPSG:4326")
+    home = {k: v for k, v in TOWNS.items() if k in ("Reidsville", "Eden", "Madison", "Mayodan",
+                                                    "Stoneville", "Wentworth")}
+    names = []
+    for _, r in tr.iterrows():
+        pt = r.geometry.representative_point()
+        near = min(home, key=lambda t: km(pt.y, pt.x, *home[t]))
+        code = r["TRACT"][5:]
+        num = str(int(code[:4])) + ("" if code[4:] == "00" else "." + code[4:])
+        names.append(f"Tract {num} ({near})")
+    tr["TRACT_NAME"] = names
+    return tr
 
+
+def assign_tracts(cb, tr):
+    """Pickup census tract of each clinic-bound leg (blank if outside the county)."""
+    import geopandas as gpd
     pts = cb[cb["ORIG_COORD_OK"]]
     g = gpd.GeoDataFrame(index=pts.index, crs="EPSG:4326",
                          geometry=gpd.points_from_xy(pts["ORIG_LON"], pts["ORIG_LAT"]))
     j = gpd.sjoin(g, tr, how="left", predicate="within")
     j = j[~j.index.duplicated()]
-    tract_of = j["TRACT"].reindex(pts.index)
+    return j["TRACT"].reindex(cb.index)
+
+
+def fig1_tracts(cb, tr, sites, counties, out_png, out_csv):
+    from matplotlib.colors import LinearSegmentedColormap, Normalize
+    pts = cb[cb["ORIG_COORD_OK"]]
+    tract_of = cb.loc[pts.index, "TRACT"]
     per = pts.assign(TRACT=tract_of).groupby("TRACT").agg(
         CLINIC_BOUND_PICKUPS=("PURPOSE", "size"),
         DIALYSIS=("PURPOSE", lambda s: (s == "Dialysis").sum()),
@@ -652,6 +678,39 @@ def rider_bootstrap(cb, rng):
     return out
 
 
+def model_check(d, rng, n_folds=5):
+    """Does the network predict a recorded aid for riders it has not seen?
+    Hold out ~20% of pickup locations (stand-in for riders) per fold; compare the
+    full network with purpose-only and with the overall rate."""
+    from sklearn.metrics import log_loss, roc_auc_score
+    codes = {v: {s: i for i, s in enumerate(sorted(d[v].unique()))} for v in BN_VARS}
+
+    def fit_predict(train, test, pa):
+        shape = [2] + [len(codes[p]) for p in pa]
+        c = np.zeros(shape)
+        np.add.at(c, tuple(train[x].map(codes[x]).to_numpy() for x in [TARGET] + pa), 1)
+        c += EQUIV_SAMPLE_SIZE / np.prod(shape)
+        c = c / c.sum(axis=0, keepdims=True)
+        yes = codes[TARGET]["Yes"]
+        return c[(np.full(len(test), yes),) + tuple(test[p].map(codes[p]).to_numpy() for p in pa)]
+
+    locs = d["LOC"].unique()
+    rows = []
+    for k in range(n_folds):
+        hold = set(rng.choice(locs, size=len(locs) // 5, replace=False))
+        tr_, te_ = d[~d["LOC"].isin(hold)], d[d["LOC"].isin(hold)]
+        y = (te_[TARGET] == "Yes").astype(int).to_numpy()
+        full = sorted(learn(tr_).get_parents(TARGET))
+        preds = {"overall rate": np.full(len(y), (tr_[TARGET] == "Yes").mean()),
+                 "purpose only": fit_predict(tr_, te_, ["PURPOSE"]),
+                 "full network": fit_predict(tr_, te_, full)}
+        for name, pr in preds.items():
+            rows.append({"MODEL": name, "AUC": roc_auc_score(y, pr) if pr.std() > 0 else 0.5,
+                         "LOG_LOSS": log_loss(y, np.clip(pr, 1e-6, 1 - 1e-6)),
+                         "ACCURACY": ((pr >= 0.5) == y).mean()})
+    return pd.DataFrame(rows).groupby("MODEL", sort=False).mean().reset_index()
+
+
 def summarise(draws):
     return np.median(draws, axis=0), np.percentile(draws, 2.5, axis=0), np.percentile(draws, 97.5, axis=0)
 
@@ -666,7 +725,7 @@ NODE_LABEL = {"DOW": "Day of week", "SEASON": "Season", "PURPOSE": "Trip purpose
               "RECORDED_AID": "Recorded\nmobility aid"}
 
 
-def fig3(dag, freq, out_png):
+def fig3(dag, freq, check, out_png):
     fig, ax = plt.subplots(figsize=(11, 8))
     r = 0.34
     for v, (x, y) in NODE_POS.items():
@@ -697,6 +756,11 @@ def fig3(dag, freq, out_png):
     ax.text(-0.7, -1.62, "Constraints, not links: day of week and season may only point outward; "
             "the recorded aid may only receive arrows. Learned links: hill-climbing search with "
             "the BIC score.", fontsize=7.5, color=C["ink2"], wrap=True)
+    a = check.set_index("MODEL")["AUC"]
+    ax.text(-0.7, -1.82, f"Check on held-out pickup locations (new riders): purpose only AUC "
+            f"{a['purpose only']:.2f}, full network {a['full network']:.2f}, overall rate 0.50. "
+            "Links learned beyond purpose mostly reflect repeat riders and do not carry over to new ones "
+            "(fig3_model_check.csv).", fontsize=7.5, color=C["ink2"], wrap=True)
     save(fig, out_png)
 
 
@@ -725,10 +789,10 @@ def fig4(cb, bn_draws, rb_draws, out_png, out_csv):
     fig, (a1, a2) = plt.subplots(2, 1, figsize=(11, 5.6), gridspec_kw={"height_ratios": [2, 1]})
     for j, p in enumerate(PURPOSES):
         y = 1 - j
-        a1.plot([rl[j], rh[j]], [y - 0.12] * 2, color=C[p], lw=2, alpha=0.55, solid_capstyle="round")
-        a1.plot([bl[j], bh[j]], [y + 0.12] * 2, color=C[p], lw=5, solid_capstyle="round")
-        a1.scatter([bm[j]], [y + 0.12], s=22, color=C["surface"], edgecolor=C[p], linewidth=1.5, zorder=3)
-        a1.scatter([rm[j]], [y - 0.12], s=55, color=C[p], alpha=0.55, edgecolor=C["surface"], linewidth=2, zorder=3)
+        a1.plot([rl[j], rh[j]], [y + 0.1] * 2, color=C[p], lw=5, solid_capstyle="round")
+        a1.scatter([rm[j]], [y + 0.1], s=70, color=C[p], edgecolor=C["surface"], linewidth=2, zorder=3)
+        a1.plot([bl[j], bh[j]], [y - 0.14] * 2, color=C["muted"], lw=2, solid_capstyle="round")
+        a1.scatter([bm[j]], [y - 0.14], s=18, color=C["muted"], zorder=3)
         o = obs.loc[p]
         a1.text(1.01, y, f"{int(o['n']):,} trip legs · {int(o['y']):,} with recorded aid\n"
                 f"{int(o['locations']):,} pickup locations · observed {100 * o['y'] / o['n']:.1f}%",
@@ -740,25 +804,27 @@ def fig4(cb, bn_draws, rb_draws, out_png, out_csv):
     a1.grid(axis="x", color=C["grid"], lw=0.8)
     a1.set_axisbelow(True)
     a1.set_title("Probability that a clinic-bound trip leg has a recorded mobility aid", loc="left")
-    a1.plot([], [], color=C["ink2"], lw=5, label="Bayesian network: median, 95% credible interval (trip legs independent)")
-    a1.plot([], [], color=C["ink2"], lw=2, alpha=0.55, label="repeat-rider check: Bayesian bootstrap over pickup locations")
+    a1.plot([], [], color=C["ink2"], lw=5, marker="o", ms=7,
+            label="median and 95% credible interval, allowing for repeat riders (Bayesian bootstrap over pickup locations)")
+    a1.plot([], [], color=C["muted"], lw=2, marker="o", ms=4,
+            label="network posterior treating every trip leg as independent (too narrow: same riders repeat)")
     a1.legend(loc="lower center", bbox_to_anchor=(0.5, -0.42), ncol=1, frameon=False, fontsize=8)
 
     lo_b, hi_b = np.percentile(diff_bn, [2.5, 97.5])
     lo_r, hi_r = np.percentile(diff_rb, [2.5, 97.5])
-    a2.plot([lo_r, hi_r], [-0.12] * 2, color=C["ink2"], lw=2, alpha=0.55)
-    a2.plot([lo_b, hi_b], [0.12] * 2, color=C["ink"], lw=5)
-    a2.scatter([np.median(diff_bn)], [0.12], s=22, color=C["surface"], edgecolor=C["ink"], linewidth=1.5, zorder=3)
-    a2.scatter([np.median(diff_rb)], [-0.12], s=55, color=C["ink2"], alpha=0.55, edgecolor=C["surface"], linewidth=2, zorder=3)
+    a2.plot([lo_r, hi_r], [0.1] * 2, color=C["ink"], lw=5, solid_capstyle="round")
+    a2.scatter([np.median(diff_rb)], [0.1], s=70, color=C["ink"], edgecolor=C["surface"], linewidth=2, zorder=3)
+    a2.plot([lo_b, hi_b], [-0.14] * 2, color=C["muted"], lw=2)
+    a2.scatter([np.median(diff_bn)], [-0.14], s=18, color=C["muted"], zorder=3)
     a2.axvline(0, color=C["muted"], lw=1)
     a2.set_yticks([0], ["Dialysis minus\nother medical"])
     a2.set_ylim(-0.5, 0.5)
     a2.set_xlim(-0.1, 0.5)
     a2.xaxis.set_major_formatter(plt.matplotlib.ticker.PercentFormatter(1))
     a2.grid(axis="x", color=C["grid"], lw=0.8)
-    a2.set_title(f"Difference: {100 * np.median(diff_bn):.0f} percentage points "
-                 f"(95% CrI {100 * lo_b:.0f} to {100 * hi_b:.0f}; repeat-rider check "
-                 f"{100 * lo_r:.0f} to {100 * hi_r:.0f})", loc="left", fontsize=10)
+    a2.set_title(f"Difference: {100 * np.median(diff_rb):.0f} percentage points higher for dialysis "
+                 f"(95% CrI {100 * lo_r:.0f} to {100 * hi_r:.0f}; trip-level {100 * lo_b:.0f} to {100 * hi_b:.0f})",
+                 loc="left", fontsize=10)
     fig.tight_layout(h_pad=3.5)
     save(fig, out_png)
     return summary
@@ -767,17 +833,20 @@ def fig4(cb, bn_draws, rb_draws, out_png, out_csv):
 # ============================================================
 # FIG 5: where to review accessible service
 # ============================================================
-def fig5(cb, areas, out_png, out_csv):
-    order = list(areas["AREA"])
-    n = cb.groupby(["DOW", "AREA"]).size().unstack(fill_value=0).reindex(index=DOW_ORDER, columns=order, fill_value=0)
-    a = cb[cb["RECORDED_AID"] == "Yes"].groupby(["DOW", "AREA"]).size().unstack(fill_value=0) \
-        .reindex(index=DOW_ORDER, columns=order, fill_value=0)
+def fig5(cb, col, out_png, out_csv):
+    """Rows = pickup tract (or pickup area), columns = weekday."""
+    unit = "census tract" if col == "TRACT_NAME" else "pickup area"
+    c = cb[cb[col].notna()]
+    n = c.groupby([col, "DOW"]).size().unstack(fill_value=0).reindex(columns=DOW_ORDER, fill_value=0)
+    n = n.loc[n.sum(axis=1).sort_values(ascending=False).index]
+    a = c[c["RECORDED_AID"] == "Yes"].groupby([col, "DOW"]).size().unstack(fill_value=0) \
+        .reindex(index=n.index, columns=DOW_ORDER, fill_value=0)
     cells = pd.concat({"trips": n, "with_recorded_aid": a.where(n >= MIN_CELL_AID)}, axis=1)
     cells.to_csv(out_csv)
 
     cmap = plt.matplotlib.colors.LinearSegmentedColormap.from_list("blues", BLUES)
     shown = n.where(n >= MIN_CELL_SHOW)
-    fig, ax = plt.subplots(figsize=(13, 5.8))
+    fig, ax = plt.subplots(figsize=(11, 0.42 * len(n) + 2.2))
     im = ax.imshow(shown.to_numpy(float), cmap=cmap, aspect="auto", vmin=0)
     norm = im.norm
     for i in range(n.shape[0]):
@@ -791,20 +860,22 @@ def fig5(cb, areas, out_png, out_csv):
                 txt = f"{v:,}\n{aid:,} with aid ({100 * aid / v:.0f}%)"
                 col = "white" if norm(v) > 0.55 else C["ink"]
             ax.text(j, i, txt, ha="center", va="center", fontsize=7.5, color=col)
-    ax.set_xticks(range(len(order)), [f"{c}\n({n[c].sum():,})" for c in order], fontsize=8)
-    ax.set_yticks(range(len(DOW_ORDER)), [f"{d} ({n.loc[d].sum():,})" for d in DOW_ORDER])
-    ax.set_xticks(np.arange(-0.5, len(order)), minor=True)
-    ax.set_yticks(np.arange(-0.5, len(DOW_ORDER)), minor=True)
+    ax.set_xticks(range(n.shape[1]), [f"{d}\n({n[d].sum():,})" for d in n.columns])
+    ax.xaxis.tick_top()
+    ax.set_yticks(range(n.shape[0]), [f"{r} ({n.loc[r].sum():,})" for r in n.index], fontsize=8)
+    ax.set_xticks(np.arange(-0.5, n.shape[1]), minor=True)
+    ax.set_yticks(np.arange(-0.5, n.shape[0]), minor=True)
     ax.grid(which="minor", color=C["surface"], lw=2)
     ax.tick_params(which="minor", length=0)
     for s in ax.spines.values():
         s.set_visible(False)
     fig.colorbar(im, ax=ax, shrink=0.8, label="clinic-bound trip legs, FY2024")
-    ax.set_title("Clinic-bound trips by weekday and pickup area (totals in brackets)", loc="left")
-    fig.text(0.01, 0.01, f"Cells with fewer than {MIN_CELL_SHOW} trips are suppressed; recorded-aid "
+    ax.set_title(f"Clinic-bound trips by pickup {unit} and weekday, FY2024 (totals in brackets)",
+                 loc="left", pad=34)
+    fig.text(0.01, 0.005, f"Cells with fewer than {MIN_CELL_SHOW} trips are suppressed; recorded-aid "
              f"counts are shown only where a cell has at least {MIN_CELL_AID} trips. "
-             "Pickup areas are k-means clusters of pickup locations. Table: fig5_cells.csv", fontsize=8, color=C["ink2"])
-    fig.tight_layout(rect=(0, 0.03, 1, 1))
+             f"Rows sorted by total. Table: fig5_cells.csv", fontsize=8, color=C["ink2"])
+    fig.tight_layout(rect=(0, 0.02, 1, 1))
     save(fig, out_png)
     return cells
 
@@ -832,10 +903,15 @@ def main():
           f"clinic-bound legs: {len(cb):,}")
 
     counties = load_counties()
+    have_tracts = False
     try:
-        fig1_tracts(cb, sites, counties, out("fig1_origins_map.png"), out("fig1_tracts.csv"))
+        tr = load_tracts()
+        cb["TRACT"] = assign_tracts(cb, tr)
+        cb["TRACT_NAME"] = cb["TRACT"].map(tr.set_index("TRACT")["TRACT_NAME"])
+        fig1_tracts(cb, tr, sites, counties, out("fig1_origins_map.png"), out("fig1_tracts.csv"))
+        have_tracts = True
     except Exception as e:                       # no geopandas / no census access
-        print(f"Tract map not available ({type(e).__name__}: {e}); drawing pickup-area map instead.")
+        print(f"Tract map not available ({type(e).__name__}: {e}); using pickup areas instead.")
         fig1(cb, areas, sites, counties, out("fig1_origins_map.png"))
     t2 = fig2(h, out("fig2_monthly.png"), out("fig2_monthly_table.csv"))
     print(t2.to_string())
@@ -847,7 +923,11 @@ def main():
                   for u, v in dag.edges()], columns=["FROM", "TO", "KIND", "BOOTSTRAP_FREQ"]) \
         .to_csv(out("fig3_edges.csv"), index=False)
     print("Network links:", sorted(dag.edges()))
-    fig3(dag, freq, out("fig3_network.png"))
+    d["LOC"] = cb["ORIG_PT"].astype(str).to_numpy()
+    check = model_check(d, rng)
+    check.to_csv(out("fig3_model_check.csv"), index=False)
+    print("Model check on held-out pickup locations:\n" + check.round(3).to_string(index=False))
+    fig3(dag, freq, check, out("fig3_network.png"))
 
     parents = {v: sorted(dag.get_parents(v)) for v in BN_VARS}
     bn_draws = posterior_draws(d, states, parents, rng)
@@ -855,7 +935,7 @@ def main():
     s4 = fig4(cb, bn_draws, rb_draws, out("fig4_aid_probability.png"), out("fig4_posterior_summary.csv"))
     print(s4.round(3).to_string(index=False))
 
-    fig5(cb, areas, out("fig5_review_heatmap.png"), out("fig5_cells.csv"))
+    fig5(cb, "TRACT_NAME" if have_tracts else "AREA", out("fig5_review_heatmap.png"), out("fig5_cells.csv"))
     print(f"\nOutputs in: {os.path.abspath(OUT_DIR)}")
     return h, cb, sites, dag
 
