@@ -1,8 +1,10 @@
 """
 Healthcare transportation in Rockingham County, FY2024: five report figures.
 
-    Fig 1  Where healthcare rides originate: clinic-bound pickups aggregated to service
-           areas (left) and to ~1.5 km hexagons (right), with clinic destinations.
+    Fig 1  Where healthcare rides originate: clinic-bound pickups by census tract with
+           clinic destinations (left); households without a vehicle by tract with the same
+           pickups as tract-level circles, overlap tracts outlined (right). Falls back to
+           pickup areas + hexagons if geopandas or the census files are unavailable.
     Fig 2  Healthcare transportation across FY2024: monthly trip legs (stacked bars) and
            each purpose's trips per service day (lines), as two separate panels.
     Fig 3  Bayesian network structure for a recorded mobility aid, with the assumed link
@@ -39,10 +41,10 @@ UNCERTAINTY (Fig 4)
     riders: a home may hold several riders, and a rider may move). Its interval is the
     more honest one to quote.
 
-NOT INCLUDED
-    Tract-level vehicle availability (ACS table B25044) and census tract boundaries:
-    not reachable from the session that wrote this. Add them as a second map panel
-    when available.
+VEHICLE AVAILABILITY (Fig 1 right)
+    ACS 2019-2023 5-year table B25044: households with no vehicle (owner + renter) / all
+    households, by 2020 census tract, with margins of error (fig1_tracts.csv). Overlap
+    tracts = above the county median on BOTH clinic-bound pickups and no-vehicle share.
 
 Outputs (OUT_DIR): fig1_origins_map.png ... fig5_review_heatmap.png, plus the tables
 behind each figure (CSV) and clinic_sites_inferred.csv.
@@ -95,6 +97,14 @@ N_DRAWS = 2000               # posterior draws
 EQUIV_SAMPLE_SIZE = 10       # BDeu prior strength
 N_BOOT = 30                  # bootstrap re-learns for edge stability
 SEED = 0
+
+# Census (Fig 1 by tract + vehicle availability). Downloaded once into CENSUS_DIR.
+CENSUS_DIR = "data/census"
+TRACTS_URL = "https://www2.census.gov/geo/tiger/TIGER2023/TRACT/tl_2023_37_tract.zip"
+ACS_URL = ("https://www2.census.gov/programs-surveys/acs/summary_file/2023/table-based-SF/"
+           "data/5YRData/acsdt5y2023-b25044.dat")       # ACS 2019-2023 5-yr, tenure by vehicles
+STATE_COUNTY = "37157"
+ORANGES = ["#fde3d6", "#f9c3a8", "#f4a07b", "#ec7c50", "#d95926", "#b4441a", "#8a3313"]
 
 PURPOSES = ["Dialysis", "Other medical"]
 DOW_ORDER = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
@@ -286,6 +296,7 @@ def set_map_extent(ax, lats, lons, pad=0.04):
     ax.set_ylim(np.nanmin(lats) - pad, np.nanmax(lats) + pad)
     ax.set_aspect(1 / SX)
     ax.set_xticks([]); ax.set_yticks([])
+    ax.set_xlabel(""); ax.set_ylabel("")
     for s in ax.spines.values():
         s.set_visible(False)
 
@@ -370,6 +381,141 @@ def fig1(cb, areas, sites, counties, out_png):
     fig.tight_layout(rect=(0, 0.04, 1, 0.9))
     save(fig, out_png)
 
+
+
+# ============================================================
+# FIG 1 (tracts): pickups by tract + households without vehicles
+# ============================================================
+def census_file(url):
+    import urllib.request
+    os.makedirs(CENSUS_DIR, exist_ok=True)
+    path = os.path.join(CENSUS_DIR, os.path.basename(url))
+    if not os.path.exists(path):
+        print(f"Downloading {url} ...")
+        urllib.request.urlretrieve(url, path + ".part")
+        os.replace(path + ".part", path)
+    return path
+
+
+def acs_no_vehicle():
+    """Households and households with no vehicle per tract (ACS B25044), with MOEs."""
+    cache = os.path.join(CENSUS_DIR, f"acs2023_b25044_tracts_{STATE_COUNTY}.csv")
+    if not os.path.exists(cache):
+        dat, prefix, rows = census_file(ACS_URL), f"1400000US{STATE_COUNTY}", []
+        with open(dat) as fh:
+            header = fh.readline().strip().split("|")
+            rows = [ln.strip().split("|") for ln in fh if ln.startswith(prefix)]
+        a = pd.DataFrame(rows, columns=header)
+        num = lambda c: pd.to_numeric(a[c], errors="coerce")
+        pd.DataFrame({"TRACT": a["GEO_ID"].str.replace("1400000US", "", regex=False),
+                      "HOUSEHOLDS": num("B25044_E001"), "HOUSEHOLDS_MOE": num("B25044_M001"),
+                      "NO_VEHICLE_HH": num("B25044_E003") + num("B25044_E010"),
+                      "NO_VEHICLE_HH_MOE": np.sqrt(num("B25044_M003") ** 2 + num("B25044_M010") ** 2)}
+                     ).to_csv(cache, index=False)
+        os.remove(dat)                                   # ~60 MB national file; keep the extract
+    acs = pd.read_csv(cache, dtype={"TRACT": str})
+    acs["NO_VEHICLE_SHARE"] = acs["NO_VEHICLE_HH"] / acs["HOUSEHOLDS"]
+    # ACS approximation for the MOE of a proportion
+    p = acs["NO_VEHICLE_SHARE"]
+    inner = acs["NO_VEHICLE_HH_MOE"] ** 2 - (p ** 2) * acs["HOUSEHOLDS_MOE"] ** 2
+    inner = inner.where(inner > 0, acs["NO_VEHICLE_HH_MOE"] ** 2 + (p ** 2) * acs["HOUSEHOLDS_MOE"] ** 2)
+    acs["NO_VEHICLE_SHARE_MOE"] = np.sqrt(inner) / acs["HOUSEHOLDS"]
+    return acs
+
+
+def fig1_tracts(cb, sites, counties, out_png, out_csv):
+    import geopandas as gpd
+    from matplotlib.colors import LinearSegmentedColormap, Normalize
+    tr = gpd.read_file(census_file(TRACTS_URL))
+    tr = tr[tr["COUNTYFP"] == STATE_COUNTY[2:]][["GEOID", "geometry"]].rename(columns={"GEOID": "TRACT"})
+    tr = tr.to_crs("EPSG:4326")
+
+    pts = cb[cb["ORIG_COORD_OK"]]
+    g = gpd.GeoDataFrame(index=pts.index, crs="EPSG:4326",
+                         geometry=gpd.points_from_xy(pts["ORIG_LON"], pts["ORIG_LAT"]))
+    j = gpd.sjoin(g, tr, how="left", predicate="within")
+    j = j[~j.index.duplicated()]
+    tract_of = j["TRACT"].reindex(pts.index)
+    per = pts.assign(TRACT=tract_of).groupby("TRACT").agg(
+        CLINIC_BOUND_PICKUPS=("PURPOSE", "size"),
+        DIALYSIS=("PURPOSE", lambda s: (s == "Dialysis").sum()),
+        WITH_RECORDED_AID=("RECORDED_AID", lambda s: (s == "Yes").sum()))
+    outside = int(tract_of.isna().sum())
+
+    t = tr.merge(acs_no_vehicle(), on="TRACT", how="left").merge(per, on="TRACT", how="left")
+    t[["CLINIC_BOUND_PICKUPS", "DIALYSIS", "WITH_RECORDED_AID"]] = \
+        t[["CLINIC_BOUND_PICKUPS", "DIALYSIS", "WITH_RECORDED_AID"]].fillna(0).astype(int)
+    t["PICKUPS_PER_100_HH"] = 100 * t["CLINIC_BOUND_PICKUPS"] / t["HOUSEHOLDS"]
+    med_p, med_v = t["CLINIC_BOUND_PICKUPS"].median(), t["NO_VEHICLE_SHARE"].median()
+    t["OVERLAP"] = (t["CLINIC_BOUND_PICKUPS"] > med_p) & (t["NO_VEHICLE_SHARE"] > med_v)
+    t.drop(columns="geometry").sort_values("CLINIC_BOUND_PICKUPS", ascending=False).to_csv(out_csv, index=False)
+
+    fig, axes = plt.subplots(1, 2, figsize=(15, 6.8))
+    blues = LinearSegmentedColormap.from_list("blues", BLUES)
+    oranges = LinearSegmentedColormap.from_list("oranges", ORANGES)
+
+    # Left: pickups per tract (counts under MIN_CELL_SHOW are drawn as "<10", same pale fill)
+    ax = axes[0]
+    shown = t["CLINIC_BOUND_PICKUPS"].where(t["CLINIC_BOUND_PICKUPS"] >= MIN_CELL_SHOW, 0)
+    norm_p = Normalize(0, shown.max())
+    t.assign(V=shown).plot(ax=ax, column="V", cmap=blues, norm=norm_p, edgecolor=C["surface"], linewidth=1.6, zorder=2)
+    for _, r in t.nlargest(6, "CLINIC_BOUND_PICKUPS").iterrows():
+        pt = r.geometry.representative_point()
+        ax.text(pt.x, pt.y, f"{r['CLINIC_BOUND_PICKUPS']:,}", ha="center", va="center", fontsize=7.5,
+                fontweight="bold", color=C["ink"], zorder=8,
+                bbox=dict(boxstyle="round,pad=0.2", fc=C["surface"], ec="none", alpha=0.85))
+    draw_context(ax, counties, towns=False)
+    draw_clinics(ax, sites)
+    ax.set_title("Clinic-bound pickups by census tract (6 largest labelled)", loc="left")
+    ax.text(0, -0.13, f"{int(t['CLINIC_BOUND_PICKUPS'].sum()):,} clinic-bound trip legs in {len(t)} tracts; "
+            f"{outside} picked up outside the county. No individual pickups are shown.",
+            transform=ax.transAxes, fontsize=8, color=C["ink2"], va="top")
+    fig.colorbar(plt.cm.ScalarMappable(norm=norm_p, cmap=blues), ax=ax, shrink=0.6,
+                 label="clinic-bound pickups (trip legs), FY2024")
+
+    # Right: no-vehicle share + pickups as circles at tract centres; overlap tracts outlined
+    ax = axes[1]
+    norm_v = Normalize(0, t["NO_VEHICLE_SHARE"].max())
+    t.plot(ax=ax, column="NO_VEHICLE_SHARE", cmap=oranges, norm=norm_v, edgecolor=C["surface"],
+           linewidth=1.6, zorder=2)
+    t[t["OVERLAP"]].boundary.plot(ax=ax, color=C["ink"], linewidth=2.2, zorder=4)
+    rp = t.geometry.representative_point()
+    size = lambda n: 12 + 520 * n / t["CLINIC_BOUND_PICKUPS"].max()
+    big = t["CLINIC_BOUND_PICKUPS"] >= MIN_CELL_SHOW
+    ax.scatter(rp.x[big], rp.y[big], s=size(t.loc[big, "CLINIC_BOUND_PICKUPS"]), facecolor=C["Dialysis"],
+               alpha=0.55, edgecolor=C["surface"], linewidth=1.2, zorder=5)
+    draw_context(ax, counties)
+    for n in (100, 500, 1500):
+        ax.scatter([], [], s=size(n), facecolor=C["Dialysis"], alpha=0.55, edgecolor=C["surface"],
+                   label=f"{n:,} pickups")
+    ax.plot([], [], color=C["ink"], lw=2.2, label="above county median on both")
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.03), ncol=4, frameon=False, fontsize=7.5,
+              columnspacing=1.6)
+    ax.set_title("Households without a vehicle, with clinic-bound pickups", loc="left")
+    ax.text(0, -0.13, f"ACS 2019-2023 5-year (B25044), 2020 tracts; county median {med_v:.1%}. "
+            "Margins of error in fig1_tracts.csv.", transform=ax.transAxes, fontsize=8,
+            color=C["ink2"], va="top")
+    cb_ = fig.colorbar(plt.cm.ScalarMappable(norm=norm_v, cmap=oranges), ax=ax, shrink=0.6,
+                       label="share of households with no vehicle")
+    cb_.formatter = plt.matplotlib.ticker.PercentFormatter(1)
+    cb_.update_ticks()
+
+    bounds = t.total_bounds
+    for a in axes:
+        set_map_extent(a, [bounds[1], bounds[3]], [bounds[0], bounds[2]], pad=0.02)
+    axes[0].legend(loc="upper center", bbox_to_anchor=(0.5, -0.03), ncol=2, frameon=False, fontsize=7.5,
+                   markerscale=0.7)
+    fig.suptitle("Where healthcare rides originate (FY2024)", fontsize=13, fontweight="bold", x=0.01, ha="left")
+    fig.text(0.01, 0.915, "Clinic destinations are inferred from trip patterns (marker size = clinic-bound "
+             "arrivals) and are not verified against a facility list unless marked verified.",
+             fontsize=8, color=C["ink2"])
+    fig.tight_layout(rect=(0, 0.04, 1, 0.9))
+    save(fig, out_png)
+    ov = t[t["OVERLAP"]].sort_values("CLINIC_BOUND_PICKUPS", ascending=False)
+    print(f"Overlap tracts (above median on pickups and no-vehicle share): {len(ov)}")
+    print(ov[["TRACT", "CLINIC_BOUND_PICKUPS", "NO_VEHICLE_SHARE", "NO_VEHICLE_SHARE_MOE"]]
+          .round(3).to_string(index=False))
+    return t
 
 # ============================================================
 # FIG 2: healthcare transportation across FY2024
@@ -649,7 +795,7 @@ def fig5(cb, areas, out_png, out_csv):
     ax.set_title("Clinic-bound trips by weekday and pickup area (totals in brackets)", loc="left")
     fig.text(0.01, 0.01, f"Cells with fewer than {MIN_CELL_SHOW} trips are suppressed; recorded-aid "
              f"counts are shown only where a cell has at least {MIN_CELL_AID} trips. "
-             "Pickup areas match Fig 1. Table: fig5_cells.csv", fontsize=8, color=C["ink2"])
+             "Pickup areas are k-means clusters of pickup locations. Table: fig5_cells.csv", fontsize=8, color=C["ink2"])
     fig.tight_layout(rect=(0, 0.03, 1, 1))
     save(fig, out_png)
     return cells
@@ -678,7 +824,11 @@ def main():
           f"clinic-bound legs: {len(cb):,}")
 
     counties = load_counties()
-    fig1(cb, areas, sites, counties, out("fig1_origins_map.png"))
+    try:
+        fig1_tracts(cb, sites, counties, out("fig1_origins_map.png"), out("fig1_tracts.csv"))
+    except Exception as e:                       # no geopandas / no census access
+        print(f"Tract map not available ({type(e).__name__}: {e}); drawing pickup-area map instead.")
+        fig1(cb, areas, sites, counties, out("fig1_origins_map.png"))
     t2 = fig2(h, out("fig2_monthly.png"), out("fig2_monthly_table.csv"))
     print(t2.to_string())
 
