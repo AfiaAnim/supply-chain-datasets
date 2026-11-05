@@ -41,6 +41,9 @@ Prediction (PREDICT = True):
          Linear                    depth = a + b * river(t - lag)
          Threshold                 depth = base + b * max(0, river(t - lag) - threshold)
                                    (the ditch only fills once the river tops a threshold)
+         Threshold + local base    the same, with the base depth re-read from the first
+                                   BASE_CAL_H hours of the test part (the base is set by rain /
+                                   drainage, not by the river)
          Forest, river lags        random forest on the river-level inputs
          Forest, river lags + TDA  the same plus the TDA features
        Tests: train on one event and predict the other (regular -> King, King -> regular), and
