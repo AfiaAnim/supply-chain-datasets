@@ -34,11 +34,17 @@ Usage
         --trips FY24_Geocode_FINAL_Rockingham_for_NCAT.xlsx \
         --out-dir merged/ [--bg-shapefile tl_2023_37_bg.zip]
 
+    In Jupyter: just run the cell. If an input file is not at the path set below, the
+    script searches the notebook folder and then your home folder for it by name, so
+    names like "FY24_..._NCAT (1).xlsx" are found too. Or pass paths explicitly:
+        main(["--trips", "/full/path/to/FY24_Geocode_FINAL_Rockingham_for_NCAT.xlsx"])
+
 Requirements
     pip install pandas openpyxl
 """
 
 import argparse
+import fnmatch
 import json
 import os
 import re
@@ -46,10 +52,63 @@ import re
 import numpy as np
 import pandas as pd
 
+
+# ============================================================
+# USER CONFIGURATION: put full paths here if you like (optional)
+# ============================================================
+FOOT_2024_PATH = "rockingham_county_data.csv"
+FOOT_2023_PATH = "Rockingham_Foot_Traffic_2023.csv"
+TRIPS_PATH = "FY24_Geocode_FINAL_Rockingham_for_NCAT.xlsx"
+OUT_DIR = "merged"
+
+# Name patterns used to search for a file that is not at the path above.
+SEARCH_PATTERNS = {
+    "foot_2024": "*rockingham_county_data*.csv",
+    "foot_2023": "*Rockingham_Foot_Traffic_2023*.csv",
+    "trips": "*FY24*Geocode*Rockingham*.xlsx",
+}
+SKIP_DIRS = {"site-packages", "node_modules", "__pycache__", "merged"}
+
 # Rough North Carolina bounding box, used to flag bad coordinates
 # (the FY24 file has a few at lon -99, lon 0, lat 42).
 NC_LAT = (33.8, 36.6)
 NC_LON = (-84.4, -75.4)
+
+
+# ------------------------------------------------------------
+# Locating input files
+# ------------------------------------------------------------
+def _search(root, pattern):
+    hits = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        # skip hidden folders (.cache, .local, ...), Python environments and outputs
+        dirnames[:] = [d for d in dirnames
+                       if not d.startswith(".") and d not in SKIP_DIRS
+                       and not os.path.exists(os.path.join(dirpath, d, "pyvenv.cfg"))]
+        hits += [os.path.join(dirpath, f) for f in filenames
+                 if fnmatch.fnmatch(f.lower(), pattern.lower()) and not f.startswith("~$")]
+    return hits
+
+
+def find_file(path, pattern, label):
+    """Return `path` if it exists, else search the current folder, then home, by pattern."""
+    if path and os.path.exists(path):
+        return path
+    for root in (os.getcwd(), os.path.expanduser("~")):
+        hits = _search(root, pattern)
+        if hits:
+            hits.sort(key=os.path.getmtime, reverse=True)
+            if len(hits) > 1:
+                print(f"NOTE: {len(hits)} files match {label}; using the newest. Others:")
+                for h in hits[1:]:
+                    print(f"      {h}")
+            print(f"Using {label}: {hits[0]}")
+            return hits[0]
+    raise FileNotFoundError(
+        f"Could not find the {label} file.\n"
+        f"  Looked for: {path}\n"
+        f"  Searched {os.getcwd()} and {os.path.expanduser('~')} for '{pattern}'.\n"
+        f"  Copy the file into {os.getcwd()} or set its full path at the top of the script.")
 
 
 # ------------------------------------------------------------
@@ -193,12 +252,16 @@ def main(argv=None):
     """argv: list of options, e.g. ["--out-dir", "merged"]. None reads the command line.
     Unknown options (like the "-f kernel.json" Jupyter adds) are ignored."""
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--foot-2024", default="rockingham_county_data.csv")
-    ap.add_argument("--foot-2023", default="Rockingham_Foot_Traffic_2023.csv")
-    ap.add_argument("--trips", default="FY24_Geocode_FINAL_Rockingham_for_NCAT.xlsx")
-    ap.add_argument("--out-dir", default="merged")
+    ap.add_argument("--foot-2024", default=FOOT_2024_PATH)
+    ap.add_argument("--foot-2023", default=FOOT_2023_PATH)
+    ap.add_argument("--trips", default=TRIPS_PATH)
+    ap.add_argument("--out-dir", default=OUT_DIR)
     ap.add_argument("--bg-shapefile", help="census block group shapefile (.zip or .shp)")
     args, _ = ap.parse_known_args(argv)
+
+    args.foot_2024 = find_file(args.foot_2024, SEARCH_PATTERNS["foot_2024"], "2024 foot traffic")
+    args.foot_2023 = find_file(args.foot_2023, SEARCH_PATTERNS["foot_2023"], "2023 foot traffic")
+    args.trips = find_file(args.trips, SEARCH_PATTERNS["trips"], "FY24 trips")
     os.makedirs(args.out_dir, exist_ok=True)
     out = lambda name: os.path.join(args.out_dir, name)
 
