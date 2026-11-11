@@ -90,6 +90,7 @@ BIN_MM = 2.0                            # displacement bin for the calibration c
 LINEAR_FRACTION = 0.5                   # usable range: sensitivity >= this x its maximum
 NOISE_SMOOTH_S = 2.0                    # noise = residual from a Savitzky-Golay fit over this span
 SNAP_RANGE_MM = (-35.0, -10.0)          # look for the snap-through force dip in this range
+SNAP_MIN_DIP_N = 5.0                    # a dip must rise again by this much on both sides (else: none)
 
 # J4: learning curve
 LEARN_WINDOW_S = 8.0
@@ -98,6 +99,8 @@ LEARN_WINDOW_S = 8.0
 EXPLAIN_TRIAL = "trial_05"              # None = the first included trial
 EXPLAIN_WINDOW_S = 8.0
 SATURATED_BELOW_MM = -35.0              # windows deeper than this sit where the sensor saturates
+
+trapz = getattr(np, "trapezoid", None) or np.trapz     # numpy 2 renamed trapz to trapezoid
 
 COLORS = {"FastTDA": "#eb6834", "curvature": "#2a78d6", "rf": "#0d366b", "base": "#8a8984"}
 TRIAL_CMAP = plt.get_cmap("viridis")
@@ -517,15 +520,19 @@ def cycle_table(trials):
             h_c, cl, cu = hysteresis_index(xs, Cs, load, grid)
             h_f, fl, fu = hysteresis_index(xs, Fs, load, grid)
             near0, deep = xs > xs.max() - 2.0, xs < xs.min() + 2.0
-            snap = (xs >= SNAP_RANGE_MM[0]) & (xs <= SNAP_RANGE_MM[1]) & load
-            fl_snap = np.where(snap, Fs, np.inf)
-            i_snap = int(np.argmin(fl_snap)) if np.isfinite(fl_snap).any() else None
+            # snap-through = a real local dip of the force while pressing (the force eases off again
+            # before it builds up), not just the lowest value in the range: no dip -> NaN
+            ld = np.flatnonzero(load)
+            Fl = signal.savgol_filter(Fs[ld], min(len(ld) // 2 * 2 - 1, int(tr["fs"]) | 1), 2)
+            pk, prop = signal.find_peaks(-Fl, prominence=SNAP_MIN_DIP_N)
+            pk = pk[(xs[ld][pk] >= SNAP_RANGE_MM[0]) & (xs[ld][pk] <= SNAP_RANGE_MM[1])]
+            i_snap = int(ld[pk[np.argmax(-Fl[pk])]]) if pk.size else None
             rows.append({"Trial": tr["name"], "Cycle": k + 1,
                          "Cap_unloaded_pF": float(np.mean(Cs[near0])),
                          "Cap_compressed_pF": float(np.mean(Cs[deep])),
                          "Cap_swing_pF": float(np.mean(Cs[deep]) - np.mean(Cs[near0])),
                          "Peak_force_N": float(np.max(np.abs(Fs))),                    # magnitude
-                         "Hysteresis_energy_J": float(abs(np.trapz(Fs, xs / 1000))),   # loop area, N*m
+                         "Hysteresis_energy_J": float(abs(trapz(Fs, xs / 1000))),   # loop area, N*m
                          "Cap_hysteresis_pct": h_c, "Force_hysteresis_pct": h_f,
                          "Snap_through_mm": float(xs[i_snap]) if i_snap is not None else np.nan,
                          "Snap_through_force_N": float(Fs[i_snap]) if i_snap is not None else np.nan})
@@ -580,7 +587,8 @@ def repeatability(cyc):
     rows = []
     later = cyc[cyc["Cycle"] > 1]
     for c in cols:
-        within = later.groupby("Trial")[c].agg(lambda v: 100 * np.std(v, ddof=1) / abs(np.mean(v)))
+        within = later.groupby("Trial")[c].agg(          # cycles without a value (no snap-through) skipped
+            lambda v: 100 * np.std(v.dropna(), ddof=1) / abs(v.mean()) if v.notna().sum() > 1 else np.nan)
         means = later.groupby("Trial")[c].mean()
         first = cyc[cyc["Cycle"] == 1].set_index("Trial")[c]
         rows.append({"Quantity": c, "Mean (cycles 2+)": float(later[c].mean()),
@@ -889,7 +897,7 @@ def save(fig, out_dir, name):
     plt.close(fig)
 
 
-def answers(inc, g, sensor, rep, lc):
+def answers(inc, g, sensor, rep, lc, cyc):
     """Plain-language answers to the reviewer issues, from the numbers above."""
     print("\n" + "=" * 78 + "\nANSWERS TO THE REVIEWER ISSUES\n" + "=" * 78)
     used, dropped = inc[inc["Included"]], inc[~inc["Included"]]
@@ -925,11 +933,14 @@ def answers(inc, g, sensor, rep, lc):
     print(f"    Hysteresis: capacitance {sensor['Cap_hysteresis_pct'].mean():.0f}% of its range vs force "
           f"{sensor['Force_hysteresis_pct'].mean():.0f}% - the sensor reads displacement, not force.")
     r = rep.set_index("Quantity")
+    snap_n = int(cyc["Snap_through_mm"].notna().sum())
     print(f"\nJ3  Capacitance swing: cycle-to-cycle CV {r.loc['Cap_swing_pF', 'Cycle-to-cycle CV %']:.1f}%, "
           f"trial-to-trial CV {r.loc['Cap_swing_pF', 'Trial-to-trial CV %']:.1f}%; first cycle "
           f"{r.loc['Cap_swing_pF', 'First cycle vs later %']:+.0f}% vs later cycles. Peak force first cycle "
-          f"{r.loc['Peak_force_N', 'First cycle vs later %']:+.0f}% (material conditioning). Snap-through at "
-          f"{r.loc['Snap_through_mm', 'Mean (cycles 2+)']:.1f} mm (CV {r.loc['Snap_through_mm', 'Cycle-to-cycle CV %']:.1f}%). "
+          f"{r.loc['Peak_force_N', 'First cycle vs later %']:+.0f}% (material conditioning). "
+          + (f"Snap-through at {r.loc['Snap_through_mm', 'Mean (cycles 2+)']:.1f} mm (CV "
+             f"{r.loc['Snap_through_mm', 'Cycle-to-cycle CV %']:.1f}%), seen in {snap_n} cycles. "
+             if snap_n else "No snap-through dip while pressing. ") +
           f"Baseline drift {1000 * r.loc['Cap_unloaded drift (pF per cycle)', 'Mean (cycles 2+)']:+.2f} fF per cycle.")
     for tgt in TARGETS:
         s = lc[(lc["Target"] == tgt) & (lc["Model"] == "Two-branch cubic + FastTDA")]
@@ -981,7 +992,7 @@ print(f"\nJ5  What TDA measures ({tr5['name']}, {EXPLAIN_WINDOW_S:g} s windows):
 print(ex_sum.round(3).to_string(index=False))
 rho5 = plot_explain(tr5, ex, w5, d5, out_dir)
 
-answers(inc, gain, sensor, rep, lc)
+answers(inc, gain, sensor, rep, lc, cyc)
 t5 = ex_sum.set_index("Window type")
 print("\nJ5  FastTDA turns each window of the SCALED capacitance into a point cloud (x(t), x(t+tau)) and"
       " measures how fat its loop is:")
