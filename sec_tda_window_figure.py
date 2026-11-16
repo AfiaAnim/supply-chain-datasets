@@ -219,7 +219,8 @@ def make_figure(tr, wd):
     a3d = a3.twinx()
     a3d.plot(tr["t"], tr["disp"], color=C["target"], lw=0.8, ls="--")
     a3d.set_yticks([])
-    a3.legend(handles=handles, frameon=False, fontsize=8, loc="upper right")
+    a3.legend(handles=handles, frameon=False, fontsize=8, loc="upper center", bbox_to_anchor=(0.5, -0.2),
+              ncol=len(handles))                            # below the panel: never covers the data
     for a in (a1, a3):
         a.grid(color="#e4e3df", lw=0.6)
     fig.suptitle(f"{tr['name']}: sliding-window TDA of the SEC signal\n"
