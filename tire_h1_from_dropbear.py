@@ -36,12 +36,28 @@ except Exception:
     pass
 
 
+def to_local_path(path):
+    """C:\\... -> /mnt/c/... when Jupyter runs under Linux / WSL; other paths unchanged."""
+    path = str(path).strip().strip('"')
+    if os.name != "nt" and len(path) > 2 and path[1] == ":" and path[2] in "\\/":
+        return f"/mnt/{path[0].lower()}/{path[3:].replace(chr(92), '/')}"
+    return path
+
+
 # === Find the SEC and MTS files of each trial (by their columns: the file names are not reliable) ===
 def find_trials(base_path, trial_ids=None):
+    base = os.path.abspath(base_path)
+    if not os.path.isdir(base):
+        raise FileNotFoundError(f"Folder not found: {base}\nSet base_path to the folder with the csv files "
+                                f"(\".\" = the folder of this notebook: {os.path.abspath('.')})")
+    files = sorted(glob.glob(os.path.join(base, "**", "*.csv"), recursive=True))
+    print(f"Searching {base}: {len(files)} csv files")
     sec, mts = {}, {}
-    for p in sorted(glob.glob(os.path.join(base_path, "**", "*.csv"), recursive=True)):
+    for p in files:
+        name = os.path.relpath(p, base)
         m = re.search(r"trial[_\- ]?(\d+)", os.path.basename(p), re.I)
         if not m:
+            print(f"  skipped {name}: no 'trial_NN' in the file name")
             continue
         with open(p, "r", encoding="utf-8-sig", errors="replace") as f:
             header = f.readline()
@@ -49,7 +65,10 @@ def find_trials(base_path, trial_ids=None):
             sec.setdefault(int(m.group(1)), p)
         elif "RunningTime_s" in header and target_col in header:
             mts.setdefault(int(m.group(1)), p)
+        else:
+            print(f"  skipped {name}: columns not recognised (first line: {header.strip()[:80]})")
     found = sorted(set(sec) & set(mts))
+    print(f"  SEC files for trials {sorted(sec)}, MTS files for trials {sorted(mts)}")
     for n in sorted(set(sec) ^ set(mts)):
         print(f"trial_{n:02d}: {'SEC' if n in sec else 'MTS'} file only - skipped")
     return [(n, sec[n], mts[n]) for n in found if not trial_ids or n in trial_ids]
@@ -189,18 +208,23 @@ s_W = 10            # window step: 10 samples = 0.5 s (DROPBEAR: 5 = 1 ms)
 good_alignment = 0.7   # SEC-MTS |corr| below this: trial flagged (trials 01-03)
 first_cycle_s = 40.0   # windows starting before this include the first (conditioning) loading cycle
 
-base_path = r"C:/Users/daniel94/Code/tire_tda/data"          # folder with the SEC and MTS csv files
-output_path = r"C:/Users/daniel94/Code/tire_tda/h1_results"
+base_path = "."                     # folder with the SEC and MTS csv files ("." = this notebook's folder;
+                                    # a Windows path like r"C:\Users\...\data" also works under WSL)
+output_path = None                  # None = base_path/tda_results/h1_dropbear
 
 
 # === Run ===
+base_path = to_local_path(base_path)
+trials = find_trials(base_path, trial_ids)                         # checks the folder before writing anything
+output_path = to_local_path(output_path) if output_path else os.path.join(base_path, "tda_results", "h1_dropbear")
 os.makedirs(output_path, exist_ok=True)
 win_s = round(((1 / min_f) + (0.25 / max_f) * 2) * freq) / freq
 print(f"window {win_s:g} s, tau {round((0.25 / max_f) * freq / 2) / freq:g} s, stride {s}, step {s_W / freq:g} s\n")
 results = [extract_tire_h1_excel(n, sp, mp, freq, max_f, min_f, s, s_W, pass_value, output_path)
-           for n, sp, mp in find_trials(base_path, trial_ids)]
+           for n, sp, mp in trials]
 if not results:
-    raise FileNotFoundError(f"No trial with both an SEC and an MTS csv file in {base_path}")
+    raise FileNotFoundError(f"No trial with both an SEC and an MTS csv file in {os.path.abspath(base_path)} "
+                            "(see the list above: which files were found and why they were skipped)")
 
 summary = []
 for df in results:
