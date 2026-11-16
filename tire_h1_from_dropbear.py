@@ -50,15 +50,15 @@ def find_trials(base_path, trial_ids=None):
     if not os.path.isdir(base):
         raise FileNotFoundError(f"Folder not found: {base}\nSet base_path to the folder with the csv files "
                                 f"(\".\" = the folder of this notebook: {os.path.abspath('.')})")
-    files = sorted(glob.glob(os.path.join(base, "**", "*.csv"), recursive=True))
-    print(f"Searching {base}: {len(files)} csv files")
+    skip_dirs = {"lib", "lib64", "bin", "include", "share", "site-packages", "tda_results", ".ipynb_checkpoints"}
+    files = [p for p in sorted(glob.glob(os.path.join(base, "**", "*.csv"), recursive=True))
+             if not skip_dirs & set(os.path.relpath(p, base).split(os.sep)[:-1])]   # not in a venv / results folder
+    files = [p for p in files if re.search(r"trial[_\- ]?\d+", os.path.basename(p), re.I)]
+    print(f"Searching {base}: {len(files)} csv files with 'trial_NN' in the name")
     sec, mts = {}, {}
     for p in files:
         name = os.path.relpath(p, base)
         m = re.search(r"trial[_\- ]?(\d+)", os.path.basename(p), re.I)
-        if not m:
-            print(f"  skipped {name}: no 'trial_NN' in the file name")
-            continue
         with open(p, "r", encoding="utf-8-sig", errors="replace") as f:
             header = f.readline()
         if signal_col in header and "time_s" in header:
