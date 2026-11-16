@@ -15,7 +15,7 @@ Output (in output_path):
 
 Requirements:
     pip install numpy pandas scipy scikit-learn matplotlib openpyxl ripser
-    (giotto-tda is used instead when it is installed - it needs Python <= 3.11)
+    (giotto-tda is used instead when it is installed and works; it fails with scikit-learn >= 1.6)
 """
 import glob
 import os
@@ -123,20 +123,31 @@ def takens_embedding(array, delay, dimension, stride):
     return np.stack([array[:, idx + k * delay] for k in range(dimension)], axis=2)
 
 
-# === Extract H1 Persistence (giotto-tda if installed, else ripser - same Vietoris-Rips H1) ===
+# === Extract H1 Persistence (giotto-tda if it works, else ripser - same Vietoris-Rips H1) ===
+H1_BACKEND = None                   # set on the first call: "gtda" or "ripser"
+
+
 def extract_h1_persistence(embedded_windows):
+    global H1_BACKEND
+    if H1_BACKEND in (None, "gtda"):
+        try:
+            from gtda.homology import VietorisRipsPersistence
+            tda = VietorisRipsPersistence(homology_dimensions=(1,), n_jobs=1)
+            diagrams = tda.fit_transform(embedded_windows)
+            H1_BACKEND = "gtda"
+            return np.max(diagrams[:, :, 1] - diagrams[:, :, 0], axis=1)
+        except Exception as e:      # not installed, or broken by a newer scikit-learn (force_all_finite)
+            print(f"  giotto-tda not usable ({type(e).__name__}: {str(e)[:90]}) -> using ripser")
+            H1_BACKEND = "ripser"
     try:
-        from gtda.homology import VietorisRipsPersistence
-        tda = VietorisRipsPersistence(homology_dimensions=(1,), n_jobs=1)
-        diagrams = tda.fit_transform(embedded_windows)
-        return np.max(diagrams[:, :, 1] - diagrams[:, :, 0], axis=1)
+        from ripser import ripser
     except ImportError:
-        from ripser import ripser                                   # pip install ripser
-        out = np.zeros(len(embedded_windows))
-        for i, pc in enumerate(embedded_windows):
-            h1 = ripser(pc, maxdim=1)["dgms"][1]
-            out[i] = float(np.max(h1[:, 1] - h1[:, 0])) if len(h1) else 0.0
-        return out
+        raise ImportError("Install ripser:  %pip install ripser  (then restart the kernel)") from None
+    out = np.zeros(len(embedded_windows))
+    for i, pc in enumerate(embedded_windows):
+        h1 = ripser(pc, maxdim=1)["dgms"][1]
+        out[i] = float(np.max(h1[:, 1] - h1[:, 0])) if len(h1) else 0.0
+    return out
 
 
 # === Main Extraction Function ===
