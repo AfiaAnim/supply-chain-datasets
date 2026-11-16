@@ -40,20 +40,32 @@ try:                                    # make plots appear inside Jupyter
 except Exception:
     pass
 
-# === Parameters ===
-DATA_DIR = "."                          # folder with the SEC and MTS csv files (or sec\ and mts\ subfolders)
-OUTPUT_DIR = None                       # None = DATA_DIR/tda_results/target_features
-SEC_COL = "C1_raw_pF"
+# === Parameters (same names as the DROPBEAR code) ===
+DATA_DIR = "."                # folder with the SEC and MTS csv files (or sec\ and mts\ subfolders)
+OUTPUT_DIR = None             # None = DATA_DIR/tda_results/target_features
+trial_ids = None              # None = every trial found; or e.g. [10, 11, 12]
+sec_col = "C1_raw_pF"         # input signal (DROPBEAR: acc)
+
+freq = 20                     # analysis rate (Hz) after low-pass + resampling
+min_f = 0.025                 # loading frequency (Hz): the 40 s cycle; the exact value is locked per trial
+max_f = 0.075                 # highest significant SEC frequency (3rd harmonic of the loading)
+pass_value = 0.25             # low-pass cutoff (Hz): 3.3 x max_f, as in DROPBEAR (100 / 31.1)
+s_W = 1                       # output step in samples (1 = every sample at `freq`; 10 = every 0.5 s)
+
+# Derived from the frequencies (like window_size / tau in the DROPBEAR code):
+#   lock_harmonics = round(max_f / min_f)            -> 3  harmonics in the lock-in fit of the SEC
+#   n_harmonics    = int(pass_value / min_f) // 2 + 1 -> 6  harmonics used to rebuild the target
+#   band           = [0.5, 1.5] x min_f              -> 0.0125-0.0375 Hz for the SEC fundamental
+lock_harmonics = None         # None = derived; or a number
+n_harmonics = None            # None = derived; or a number
+lock_search = 0.05            # loading frequency searched within +-5% of the SEC's dominant peak
+
+# Other settings
 TARGETS = {"Displacement_m": ("Displacement (mm)", 1000.0), "Force_N": ("Force (N)", 1.0)}
-FREQ = 20.0                             # analysis rate (Hz)
-PASS_VALUE = 0.25                       # low-pass cutoff (Hz) for the level
-TARE_S = 2.0                            # capacitance baseline = median of the first TARE_S (unloaded)
-N_HARMONICS = 6                         # SEC phase: harmonics used to rebuild the target
-LOCK_HARMONICS = 3                      # SEC phase: harmonics in the lock-in fit
-LOCK_SEARCH = 0.05                      # frequency searched within +-5% of the SEC's dominant frequency
-SCORE_FROM_S = 40.0                     # score from here on (first loading cycle = conditioning)
-GOOD_OFFSET_CORR = 0.7                  # trials with weaker SEC-MTS alignment are not used
-EXAMPLE_TRIAL = None                    # trial drawn in the figure; None = first one
+TARE_S = 2.0                  # capacitance baseline = median of the first TARE_S (unloaded)
+SCORE_FROM_S = 40.0           # score from here on (first loading cycle = conditioning)
+GOOD_OFFSET_CORR = 0.7        # trials with weaker SEC-MTS alignment are not used
+EXAMPLE_TRIAL = None          # trial drawn in the figure; None = first one
 COLORS = {"SEC level": "#b8b7b2", "SEC S-curve": "#2a78d6", "SEC fundamental": "#1baf7a", "SEC phase": "#eb6834"}
 
 
@@ -74,11 +86,11 @@ def find_pairs(base):
             continue
         with open(p, "r", encoding="utf-8-sig", errors="replace") as f:
             header = f.readline()
-        if SEC_COL in header and "time_s" in header:
+        if sec_col in header and "time_s" in header:
             sec.setdefault(int(m.group(1)), p)
         elif "RunningTime_s" in header and all(c in header for c in TARGETS):
             mts.setdefault(int(m.group(1)), p)
-    return [(n, sec[n], mts[n]) for n in sorted(set(sec) & set(mts))]
+    return [(n, sec[n], mts[n]) for n in sorted(set(sec) & set(mts)) if not trial_ids or n in trial_ids]
 
 
 def lowpass(x, fc, fs, order=4):
@@ -91,7 +103,7 @@ def load_trial(num, sec_path, mts_path):
     t_s = t_s - t_s[0]
     fs = (len(t_s) - 1) / t_s[-1]
     t_u = np.arange(0, t_s[-1], 1 / fs)                                 # uneven -> uniform
-    x = lowpass(np.interp(t_u, t_s, sec[SEC_COL].to_numpy(float)), PASS_VALUE, fs)
+    x = lowpass(np.interp(t_u, t_s, sec[sec_col].to_numpy(float)), pass_value, fs)
     t_m = mts["RunningTime_s"].to_numpy(float)
     t_m = t_m - t_m[0]
     d = mts["Displacement_m"].to_numpy(float)
@@ -103,7 +115,7 @@ def load_trial(num, sec_path, mts_path):
         r = abs(np.corrcoef(np.interp(tt + lag, t_u, x), np.interp(tt, t_m, d))[0, 1])
         best = max(best, (float(lag), float(r)), key=lambda b: b[1])
     offset, r = best
-    t = np.arange(0, min(t_m[-1], t_u[-1] - offset), 1 / FREQ)
+    t = np.arange(0, min(t_m[-1], t_u[-1] - offset), 1 / freq)
     print(f"  trial_{num:02d}: offset {offset:.1f} s (|corr| {r:.2f})" + ("" if r >= GOOD_OFFSET_CORR else "  <-- NOT USED"))
     tr = {"name": f"trial_{num:02d}", "t": t, "ok": r >= GOOD_OFFSET_CORR,
           "level": np.interp(t + offset, t_u, x)}
@@ -119,14 +131,14 @@ def dominant_freq(trials):
     out = []
     for tr in trials:
         y = tr["level"] - tr["level"].mean()
-        amp, f = np.abs(np.fft.rfft(y)), np.fft.rfftfreq(len(y), 1 / FREQ)
-        ok = f >= 3 / tr["t"][-1]
+        amp, f = np.abs(np.fft.rfft(y)), np.fft.rfftfreq(len(y), 1 / freq)
+        ok = (f >= 0.5 * min_f) & (f <= 1.5 * min_f)                    # near the expected loading
         out.append(f[ok][np.argmax(amp[ok])])
     return float(np.median(out))
 
 
 def add_sec_features(tr, f0):
-    band = signal.butter(2, [0.5 * f0, 1.5 * f0], btype="bandpass", fs=FREQ, output="sos")
+    band = signal.butter(2, [0.5 * min_f, 1.5 * min_f], btype="bandpass", fs=freq, output="sos")
     tr["fundamental"] = signal.sosfiltfilt(band, tr["level"])
     # Phase locked to the SEC: the MTS loads at a constant rate, so fit the loading frequency and
     # phase to the whole SEC record (a sine + its harmonics, frequency searched near f0) and let the
@@ -134,8 +146,8 @@ def add_sec_features(tr, f0):
     # only 4 cycles and the filter needs about one period to settle at each end.)
     t, y = tr["t"], tr["level"] - tr["level"].mean()
     best = (-1.0, f0, 0.0)
-    for f in f0 * np.linspace(1 - LOCK_SEARCH, 1 + LOCK_SEARCH, 401):
-        X = np.column_stack([np.ones_like(t)] + [g(2 * np.pi * k * f * t) for k in range(1, LOCK_HARMONICS + 1)
+    for f in f0 * np.linspace(1 - lock_search, 1 + lock_search, 401):
+        X = np.column_stack([np.ones_like(t)] + [g(2 * np.pi * k * f * t) for k in range(1, lock_harmonics + 1)
                                                  for g in (np.cos, np.sin)])
         coef, res, *_ = np.linalg.lstsq(X, y, rcond=None)
         r2 = 1 - (res[0] if len(res) else np.sum((y - X @ coef) ** 2)) / np.sum(y ** 2)
@@ -153,7 +165,7 @@ def design(tr, feature):
         return np.column_stack([tr["level"], tr["level"] ** 2, tr["level"] ** 3])
     if feature == "SEC fundamental":
         return tr["fundamental"][:, None]
-    k = np.arange(1, N_HARMONICS + 1)
+    k = np.arange(1, n_harmonics + 1)
     ph = tr["phase"][:, None] * k
     return np.hstack([np.cos(ph), np.sin(ph)])                          # SEC phase: harmonic series
 
@@ -178,6 +190,10 @@ def loto(trials, feature, target):
 
 
 # === Run ===
+lock_harmonics = lock_harmonics or max(1, round(max_f / min_f))
+n_harmonics = n_harmonics or int(pass_value / min_f) // 2 + 1
+print(f"freq {freq:g} Hz, min_f {min_f:g} Hz, max_f {max_f:g} Hz, pass_value {pass_value:g} Hz -> "
+      f"lock_harmonics {lock_harmonics}, n_harmonics {n_harmonics}, output every {s_W} sample(s)")
 base = DATA_DIR
 out_dir = OUTPUT_DIR or os.path.join(base, "tda_results", "target_features")
 os.makedirs(out_dir, exist_ok=True)
@@ -186,7 +202,7 @@ trials = [tr for tr in (load_trial(*p) for p in find_pairs(base)) if tr["ok"]]
 if len(trials) < 2:
     raise RuntimeError("Need at least 2 usable trials.")
 f0 = dominant_freq(trials)
-print(f"Loading frequency from the SEC: {f0:.4f} Hz (period {1 / f0:.1f} s)")
+print(f"Loading frequency from the SEC: {f0:.4f} Hz (period {1 / f0:.1f} s; min_f = {min_f:g} Hz)")
 for tr in trials:
     add_sec_features(tr, f0)
     print(f"  {tr['name']}: SEC locked at {tr['lock_f']:.5f} Hz (fit R2 {tr['lock_r2']:.3f})")
@@ -209,10 +225,11 @@ print("\nHow well each SEC feature follows the target (calibrated on the other t
 print(pooled.round(3).to_string(index=False))
 
 for tr in trials:
-    samples.append(pd.DataFrame({"Trial": tr["name"], "Time_s": tr["t"], "SEC_level_pF": tr["level"],
-                                 "SEC_fundamental_pF": tr["fundamental"], "SEC_phase_rad": tr["phase"],
-                                 **{label: tr[c] for c, (label, _) in TARGETS.items()},
-                                 **{f"{f} -> {label}": tr[f"{f} -> {c}"] for c, (label, _) in TARGETS.items()
+    k = slice(None, None, max(1, int(s_W)))
+    samples.append(pd.DataFrame({"Trial": tr["name"], "Time_s": tr["t"][k], "SEC_level_pF": tr["level"][k],
+                                 "SEC_fundamental_pF": tr["fundamental"][k], "SEC_phase_rad": tr["phase"][k],
+                                 **{label: tr[c][k] for c, (label, _) in TARGETS.items()},
+                                 **{f"{f} -> {label}": tr[f"{f} -> {c}"][k] for c, (label, _) in TARGETS.items()
                                     for f in FEATURES}}))
 pd.concat(samples, ignore_index=True).to_csv(os.path.join(out_dir, "SEC_target_features_all_trials.csv"), index=False)
 with pd.ExcelWriter(os.path.join(out_dir, "SEC_target_features_scores.xlsx"), engine="openpyxl") as wr:
