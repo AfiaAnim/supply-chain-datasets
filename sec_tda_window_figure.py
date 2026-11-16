@@ -34,7 +34,7 @@ except Exception:
 # === Parameters (same names as the DROPBEAR / H1 code) ===
 DATA_DIR = "."                # folder with the SEC and MTS csv files (or sec\ and mts\ subfolders)
 OUTPUT_DIR = None             # None = DATA_DIR/tda_results/window_figure
-trial_ids = [10]              # trials to draw (one figure / GIF each); None = every trial found
+trial_ids = None              # trials to draw (one still + GIF each); None = every trial found
 sec_col = "C1_raw_pF"
 
 freq = 20                     # analysis rate (Hz) after low-pass + resampling
