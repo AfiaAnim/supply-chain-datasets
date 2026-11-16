@@ -208,9 +208,8 @@ s_W = 10            # window step: 10 samples = 0.5 s (DROPBEAR: 5 = 1 ms)
 good_alignment = 0.7   # SEC-MTS |corr| below this: trial flagged (trials 01-03)
 first_cycle_s = 40.0   # windows starting before this include the first (conditioning) loading cycle
 
-base_path = "."                     # folder with the SEC and MTS csv files ("." = this notebook's folder;
-                                    # a Windows path like r"C:\Users\...\data" also works under WSL)
-output_path = None                  # None = base_path/tda_results/h1_dropbear
+base_path = "/home/barbara/tire_tda"     # folder with the SEC and MTS csv files (trial_NN*.csv)
+output_path = None                       # None = /home/barbara/tire_tda/tda_results/h1_dropbear
 
 
 # === Run ===
