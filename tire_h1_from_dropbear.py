@@ -1,6 +1,10 @@
 """
-Max H1 persistence of the SEC capacitance (signal) vs the MTS displacement / force (target), per
-trial - the DROPBEAR H1 extraction fitted to the tire dataset. Paste into ONE Jupyter cell and run.
+TDA features of the SEC capacitance (signal) vs the MTS displacement / force (target), per trial -
+the DROPBEAR H1 extraction fitted to the tire dataset, with all three features studied:
+    VR H1      Vietoris-Rips max H1 persistence   (giotto-tda, or ripser)
+    Alpha H1   alpha complex max H1 persistence   (gudhi; 2*sqrt(alpha) = same distance scale as VR)
+    FastTDA    minor axis 2b of the ellipse fitted to the point cloud (NaN where it is not an ellipse)
+Paste into ONE Jupyter cell and run.
 
     DROPBEAR                         tire dataset
     acc (test file, column 3)    ->  SEC capacitance C1_raw_pF   (trial_NN_1.csv, ~261 Hz, uneven)
@@ -9,12 +13,13 @@ trial - the DROPBEAR H1 extraction fitted to the tire dataset. Paste into ONE Ju
     5000 Hz                      ->  low-pass at the file's own rate, resampled to `freq` = 20 Hz
 
 Output (in output_path):
-    H1_Features_trialNN_win{window}s.xlsx      Time, Displacement_mm, Force_N, Max H1 (one per trial)
-    H1_Features_all_trials_win{window}s.xlsx   all trials + Summary (Max H1 level, correlation with target)
-    H1_vs_target_win{window}s.png              Max H1 and the target over time, every trial
+    H1_Features_trialNN_win{window}s.xlsx      Time, Displacement_mm, Force_N, VR H1, Alpha H1, FastTDA
+    H1_Features_all_trials_win{window}s.xlsx   all trials + Summary (level and correlation with the target)
+    TDA_features_vs_target_win{window}s.png    every feature and the target over time (trial x feature)
+    TDA_features_by_trial_win{window}s.png     level of every feature per trial
 
 Requirements:
-    pip install numpy pandas scipy scikit-learn matplotlib openpyxl ripser
+    pip install numpy pandas scipy scikit-learn matplotlib openpyxl ripser gudhi
     (giotto-tda is used instead when it is installed and works; it fails with scikit-learn >= 1.6)
 """
 import glob
@@ -150,6 +155,57 @@ def extract_h1_persistence(embedded_windows):
     return out
 
 
+# === Alpha H1 (gudhi alpha complex; 2*sqrt(alpha) puts it on the same distance scale as VR) ===
+def alpha_max_h1(pc):
+    import gudhi as gd
+    try:
+        st = gd.AlphaComplex(points=pc.tolist()).create_simplex_tree()
+        st.persistence()
+        iv = np.asarray(st.persistence_intervals_in_dimension(1), dtype=float)
+    except Exception:
+        return np.nan
+    if iv.size == 0:
+        return 0.0
+    iv = iv[np.isfinite(iv).all(axis=1) & (iv[:, 1] > iv[:, 0])]
+    if iv.shape[0] == 0:
+        return 0.0
+    scaled = 2.0 * np.sqrt(np.maximum(iv, 0.0))
+    return float(np.max(scaled[:, 1] - scaled[:, 0]))
+
+
+def extract_alpha_h1(embedded_windows):
+    try:
+        import gudhi  # noqa: F401
+    except ImportError:
+        print("  Alpha H1 skipped: install gudhi  (%pip install gudhi, then restart the kernel)")
+        return np.full(len(embedded_windows), np.nan)
+    return np.array([alpha_max_h1(pc) for pc in embedded_windows])
+
+
+# === FastTDA (SVD least-squares ellipse fit, A + C = 1): minor axis 2b, NaN if not an ellipse ===
+def fasttda_minor_axis(pc):
+    X, Y = pc[:, 0] - pc[:, 0].mean(), pc[:, 1] - pc[:, 1].mean()
+    rng = max(np.abs(X).max(), np.abs(Y).max())
+    if not np.isfinite(rng) or rng == 0:
+        return np.nan
+    X, Y = X * 1.5 / rng, Y * 1.5 / rng
+    G = np.column_stack([X**2 - Y**2, X * Y, X, Y, np.ones_like(X)])
+    U, S, Vt = np.linalg.svd(G, full_matrices=False)
+    Sinv = np.where(S > np.finfo(float).eps * max(G.shape) * S[0], 1.0 / S, 0.0)
+    A, B, D, E, F = (Vt.T * Sinv) @ (U.T @ -(Y**2))
+    C = 1.0 - A
+    if 4 * A * C - B**2 <= 0:
+        return np.nan
+    th = 0.5 * np.arctan2(B, A - C)
+    c, sn = np.cos(th), np.sin(th)
+    Ap, Cp = A*c*c + B*c*sn + C*sn*sn, A*sn*sn - B*c*sn + C*c*c
+    Dp, Ep = D*c + E*sn, -D*sn + E*c
+    if Ap <= 0 or Cp <= 0:
+        return np.nan
+    Fn = F - Dp**2 / (4 * Ap) - Ep**2 / (4 * Cp)
+    return np.nan if Fn >= 0 else 2.0 * min(np.sqrt(-Fn / Ap), np.sqrt(-Fn / Cp))
+
+
 # === Main Extraction Function ===
 def extract_tire_h1_excel(trial_id, sec_file, mts_file, freq, max_f, min_f, s, s_W, pass_value, output_path):
     start_time = time.time()
@@ -172,7 +228,11 @@ def extract_tire_h1_excel(trial_id, sec_file, mts_file, freq, max_f, min_f, s, s
     scaled_windows = np.array([min_max_scale(w.reshape(-1, 1)).flatten() for w in cap_windows])
     embedded_windows = takens_embedding(scaled_windows, delay=tau, dimension=2, stride=s)
 
-    max_h1 = extract_h1_persistence(embedded_windows)
+    n_win = len(embedded_windows)
+    vr_h1 = extract_h1_persistence(embedded_windows) if COMPUTE_VR else np.full(n_win, np.nan)
+    alpha_h1 = extract_alpha_h1(embedded_windows) if COMPUTE_ALPHA else np.full(n_win, np.nan)
+    fasttda = (np.array([fasttda_minor_axis(pc) for pc in embedded_windows]) if COMPUTE_FASTTDA
+               else np.full(n_win, np.nan))
 
     df = pd.DataFrame({
         'Trial': f"trial_{trial_id:02d}",
@@ -180,7 +240,10 @@ def extract_tire_h1_excel(trial_id, sec_file, mts_file, freq, max_f, min_f, s, s
         target_name: target_windows[:, -1],
         'Force_N': force_windows[:, -1],
         'Capacitance_pF': cap_windows[:, -1],
-        'Max H1': max_h1,
+        'VR H1': vr_h1,                                             # Vietoris-Rips max H1 persistence
+        'Alpha H1': alpha_h1,                                       # alpha complex max H1 persistence
+        'FastTDA': fasttda,                                         # ellipse minor axis 2b (NaN: no ellipse)
+        'FastTDA_FitOK': np.isfinite(fasttda),
         'After_first_cycle': time_windows[:, 0] >= first_cycle_s,   # window starts after the 1st cycle
         'Alignment_OK': ok,
     })
@@ -209,15 +272,19 @@ pass_value = 0.25   # low-pass cutoff in Hz (DROPBEAR: 100): above the loading h
 # Window and delay come from min_f / max_f with the DROPBEAR formulas:
 #   window = (1 / min_f + 2 * 0.25 / max_f) * freq,   tau = (0.25 / max_f) * freq / 2
 min_f = 0.1         # -> window (10 + 10) s = 20 s = half a 40 s loading cycle: a window holding a
-max_f = 0.05        #    turnaround traces a real loop -> tau 2.5 s. Max H1 ~1.4 in trials 10-13, ~0.2 in 14-15
-# DROPBEAR rule with the loading frequencies (one whole cycle per window, Max H1 ~flat within a trial):
+max_f = 0.05        #    turnaround traces a real loop -> tau 2.5 s. VR H1 peaks ~1.4 in trials 10-13, ~0.2 in 14-15
+# DROPBEAR rule with the loading frequencies (one whole cycle per window, features ~flat within a trial):
 # min_f = 0.025     # 40 s loading cycle
 # max_f = 0.075     # its 3rd harmonic   -> window 46.6 s, tau 1.65 s (use s = 3)
 s = 2               # Takens stride (DROPBEAR: 1): 175 points per cloud, ~8x faster than s = 1 with
-                    # the same Max H1 (within ~2%); use 3 for the 46.6 s window
+                    # the same VR H1 (within ~2%); use 3 for the 46.6 s window
 s_W = 10            # window step: 10 samples = 0.5 s (DROPBEAR: 5 = 1 ms)
+COMPUTE_VR = True       # Vietoris-Rips H1  (giotto-tda, or ripser)
+COMPUTE_ALPHA = True    # Alpha H1          (gudhi)
+COMPUTE_FASTTDA = True  # FastTDA 2b        (no extra package)
 good_alignment = 0.7   # SEC-MTS |corr| below this: trial flagged (trials 01-03)
 first_cycle_s = 40.0   # windows starting before this include the first (conditioning) loading cycle
+loading_period_s = 40.0   # one loading cycle (FFT dominant period): per-cycle peaks in the by-trial figure
 
 base_path = "/home/barbara/tire_tda"     # folder with the SEC and MTS csv files (trial_NN*.csv)
 output_path = None                       # None = /home/barbara/tire_tda/tda_results/h1_dropbear
@@ -229,6 +296,7 @@ trials = find_trials(base_path, trial_ids)                         # checks the 
 output_path = to_local_path(output_path) if output_path else os.path.join(base_path, "tda_results", "h1_dropbear")
 os.makedirs(output_path, exist_ok=True)
 win_s = round(((1 / min_f) + (0.25 / max_f) * 2) * freq) / freq
+tau_s = round((0.25 / max_f) * freq / 2) / freq
 print(f"window {win_s:g} s, tau {round((0.25 / max_f) * freq / 2) / freq:g} s, stride {s}, step {s_W / freq:g} s\n")
 results = [extract_tire_h1_excel(n, sp, mp, freq, max_f, min_f, s, s_W, pass_value, output_path)
            for n, sp, mp in trials]
@@ -236,40 +304,87 @@ if not results:
     raise FileNotFoundError(f"No trial with both an SEC and an MTS csv file in {os.path.abspath(base_path)} "
                             "(see the list above: which files were found and why they were skipped)")
 
+FEATURES = [f for f, on in (("VR H1", COMPUTE_VR), ("Alpha H1", COMPUTE_ALPHA), ("FastTDA", COMPUTE_FASTTDA))
+            if on and any(df[f].notna().any() for df in results)]
+FEATURE_COLORS = {"VR H1": "#6250d6", "Alpha H1": "#1baf7a", "FastTDA": "#eb6834"}
+
 summary = []
 for df in results:
     d = df[df["After_first_cycle"]] if df["After_first_cycle"].sum() > 2 else df
-    summary.append({"Trial": d["Trial"].iloc[0], "Alignment_OK": bool(d["Alignment_OK"].iloc[0]),
-                    "Max_H1_mean": d["Max H1"].mean(), "Max_H1_peak": d["Max H1"].max(),
-                    f"Spearman_vs_{target_name}": spearman(d["Max H1"], d[target_name]),
-                    "Spearman_vs_Force_N": spearman(d["Max H1"], d["Force_N"])})
+    row = {"Trial": d["Trial"].iloc[0], "Alignment_OK": bool(d["Alignment_OK"].iloc[0])}
+    for f in FEATURES:
+        v = d[f]
+        row[f"{f} mean"], row[f"{f} sd"], row[f"{f} peak"] = v.mean(), v.std(), v.max()
+        cyc_peaks = v.groupby((d["Time"] // loading_period_s).astype(int)).max()   # peak in each cycle
+        row[f"{f} cycle peak median"] = cyc_peaks.median()
+        row[f"{f} cycle peaks"] = cyc_peaks.round(4).tolist()
+        row[f"{f} rho_{target_name}"] = spearman(v, d[target_name])
+        row[f"{f} rho_Force_N"] = spearman(v, d["Force_N"])
+    if "FastTDA" in FEATURES:
+        row["FastTDA fit ok %"] = 100 * d["FastTDA_FitOK"].mean()
+    summary.append(row)
 summary = pd.DataFrame(summary)
 with pd.ExcelWriter(os.path.join(output_path, f"H1_Features_all_trials_win{win_s:g}s.xlsx"), engine="openpyxl") as wr:
     pd.concat(results, ignore_index=True).to_excel(wr, sheet_name="Features", index=False)
     summary.to_excel(wr, sheet_name="Summary", index=False)
-print("\nSummary (windows after the first loading cycle):")
-print(summary.round(3).to_string(index=False))
+print("\nSummary (windows after the first loading cycle; rho = Spearman correlation):")
+for f in FEATURES:
+    cols = ["Trial", f"{f} mean", f"{f} cycle peak median", f"{f} rho_{target_name}", f"{f} rho_Force_N"]
+    print(f"\n  {f}")
+    print(summary[cols].rename(columns=lambda c: c.replace(f + " ", "")).round(3).to_string(index=False))
 
-# === Figure: Max H1 and the target over time, every trial ===
-fig, axes = plt.subplots(len(results), 1, figsize=(14, 2.2 * len(results)), sharex=True, squeeze=False)
-h1_top = 1.08 * max(df["Max H1"].max() for df in results)          # same Max H1 scale for every trial
-for ax, df in zip(axes[:, 0], results):
-    ax.plot(df["Time"], df[target_name], color="#8a8984", lw=1, ls="--")
-    ax.set_ylabel(target_name.replace("_", " "), color="#8a8984", fontsize=8)
-    ax2 = ax.twinx()
-    ax2.plot(df["Time"], df["Max H1"], color="#6250d6", lw=1.5)
-    ax2.set_ylabel("Max H1", color="#6250d6", fontsize=8)
-    ax2.set_ylim(0, h1_top)
-    row = summary[summary["Trial"] == df["Trial"].iloc[0]].iloc[0]
-    ax.set_title(f"{row['Trial']}: Max H1 peak {row['Max_H1_peak']:.2f}, mean {row['Max_H1_mean']:.2f}"
-                 + ("" if row["Alignment_OK"] else "  (alignment unreliable)"), fontsize=9, loc="left")
-    ax.spines[["top"]].set_visible(False)
-axes[-1, 0].set_xlabel("Time (s, end of window)")
-fig.suptitle(f"Max H1 of the SEC signal (purple, same scale in every trial) and the MTS target (dashed)"
-             f" - window {win_s:g} s",
-             fontweight="bold")
+# === Figure 1: every feature and the target over time (row = trial, column = feature) ===
+n, m = len(results), len(FEATURES)
+fig, axes = plt.subplots(n, m, figsize=(5.6 * m, 1.9 * n + 0.8), sharex=True, squeeze=False)
+tops = {f: 1.08 * np.nanpercentile(pd.concat([df[f] for df in results]), 99.5) for f in FEATURES}
+for i, df in enumerate(results):
+    for j, f in enumerate(FEATURES):
+        ax = axes[i, j]
+        ax.plot(df["Time"], df[target_name], color="#b8b7b2", lw=0.9, ls="--")
+        ax.set_yticks([])
+        ax2 = ax.twinx()
+        ax2.plot(df["Time"], df[f], color=FEATURE_COLORS[f], lw=1.3)
+        ax2.set_ylim(0, tops[f])                                    # same scale for every trial
+        ax2.tick_params(labelsize=7)
+        if i == 0:
+            ax.set_title(f"{f}  (dashed: {target_name.replace('_', ' ')})", fontsize=10, fontweight="bold",
+                         color=FEATURE_COLORS[f])
+        if j == 0:
+            ok = bool(df["Alignment_OK"].iloc[0])
+            ax.set_ylabel(df["Trial"].iloc[0].replace("trial_", "T") + ("" if ok else "\n(unreliable)"),
+                          fontsize=9, rotation=0, ha="right", va="center", color="#3d3d3a" if ok else "#e34948")
+        ax.spines[["top"]].set_visible(False)
+for ax in axes[-1, :]:
+    ax.set_xlabel("Time (s, end of window)")
+fig.suptitle(f"TDA features of the SEC signal vs the MTS target - window {win_s:g} s, tau {tau_s:g} s "
+             f"(each column: same scale for every trial)", fontweight="bold")
 fig.tight_layout()
-png = os.path.join(output_path, f"H1_vs_target_win{win_s:g}s.png")
+png = os.path.join(output_path, f"TDA_features_vs_target_win{win_s:g}s.png")
 fig.savefig(png, dpi=150)
 print(f"Saved: {png}")
 plt.show()
+plt.close(fig)
+
+# === Figure 2: level of each feature per trial - its peak in every loading cycle (after the first) ===
+# (VR / Alpha H1 are ~0 for most of a cycle with one sharp peak, so mean +- sd would mislead)
+fig, axes = plt.subplots(1, m, figsize=(4.6 * m, 3.6), squeeze=False)
+x = np.arange(len(summary))
+for ax, f in zip(axes[0], FEATURES):
+    col = np.where(summary["Alignment_OK"], FEATURE_COLORS[f], "#b8b7b2")
+    for xi, peaks, c in zip(x, summary[f"{f} cycle peaks"], col):
+        ax.scatter(np.full(len(peaks), xi), peaks, s=14, color=c, alpha=0.55, zorder=2)
+    ax.scatter(x, summary[f"{f} cycle peak median"], s=90, marker="_", linewidths=2.5, color="#3d3d3a", zorder=3)
+    ax.set_xticks(x, summary["Trial"].str.replace("trial_", "T"), fontsize=8)
+    ax.set_ylim(bottom=0)
+    ax.set_title(f, fontsize=10, fontweight="bold", color=FEATURE_COLORS[f])
+    ax.grid(axis="y", color="#e4e3df", lw=0.6)
+    ax.spines[["top", "right"]].set_visible(False)
+axes[0, 0].set_ylabel("peak in each loading cycle\n(dots; bar = median)")
+fig.suptitle("Feature level per trial: peak in every loading cycle after the first (grey = alignment unreliable)",
+             fontweight="bold")
+fig.tight_layout()
+png = os.path.join(output_path, f"TDA_features_by_trial_win{win_s:g}s.png")
+fig.savefig(png, dpi=150)
+print(f"Saved: {png}")
+plt.show()
+plt.close(fig)
