@@ -363,11 +363,13 @@ for ev in events:
     print(f"  {ev['name']}: {len(ev['h'])} samples on the {60 / freq:g}-min grid"
           f"{' (hourly information)' if harmonize_hourly else ''}; tide -> ditch lag {ev['lag_h']:+.2f} h "
           f"(r = {ev['lag_r']:.2f})")
-    v = ev["bc"][ev["t0"]:ev["t1"]]                                # a point far from each neighbour, same side
-    up, dn = v - v.shift(1), v - v.shift(-1)
-    spike = v[((up > 0.6) & (dn > 0.6)) | ((up < -0.6) & (dn < -0.6))]
+    v = ev["bc"][ev["t0"]:ev["t1"]]          # surge: > 0.4 m above every value 2-12 h before / after it
+    th = (v.index - ev["t0"]).total_seconds().values / 3600
+    far = lambda i: (np.abs(th - th[i]) >= 2) & (np.abs(th - th[i]) <= 12)
+    spike = v[[bool(far(i).any()) and v.iloc[i] > v.values[far(i)].max() + 0.4 for i in range(len(v))]]
     if len(spike):
-        print(f"    note: tide spike(s) the ditch does not follow: "
+        print(f"    note: tide peak(s) well above the neighbouring high tides (possible surge) - check the "
+              f"ditch response: "
               + ", ".join(f"{t:%d %b %H:%M} {v:.2f} m" for t, v in spike.items()))
 
 print("\nFourier (period in hours, strongest first):")
