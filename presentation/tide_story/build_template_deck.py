@@ -247,5 +247,37 @@ box(s, 8.5, TOP + 3.35, 4.1, 1.05, fill=GOLD)
 text(s, 8.65, TOP + 3.35, 3.8, 1.05, "Gaussian ellipse > FastTDA > VR / Alpha H1 >> genus-1",
      size=16, color=BLUE, bold=True, anchor=MSO_ANCHOR.MIDDLE, align=PP_ALIGN.CENTER)
 
+# ---------------- Title page (added last, moved to the front) ----------------
+t = prs.slides.add_slide(prs.slide_layouts.get_by_name("Title Slide"))
+fields = {
+    0: "Reading the shape of the tide: Gaussian ellipse vs TDA vs elliptic curves",
+    10: "When does the tide flood the ditch? A five-part story",
+    11: "Question · Method · Contest · Why it wins · Payoff",
+    12: "Tide (6202 Old Point Rd) → ditch (1235 Hillside Dr), Hanahan SC",
+    13: "Three tide events: Nov 2025, Dec 2025, Sep 2026",
+}
+for ph in t.placeholders:
+    idx = ph.placeholder_format.idx
+    tf = ph.text_frame
+    if idx == 0:                       # two lines: topic, then the comparison
+        tf.text = "Reading the shape of the tide"
+        p = tf.add_paragraph()
+        p.add_run().text = "Gaussian ellipse vs TDA vs elliptic curves"
+        tf.paragraphs[0].runs[0].font.size = Pt(48)
+        p.runs[0].font.size = Pt(32)
+    else:                              # widen the info lines so each stays on one line
+        ph.left, ph.top, ph.width, ph.height = ph.left, ph.top, Inches(11.0), ph.height
+        tf.text = fields[idx]
+t.notes_slide.notes_text_frame.text = (
+    "This talk asks one question: when does the tide flood the roadside ditch, and can the shape of the tide tell us? "
+    "We compare four ways of reading the shape of the tide in sliding windows: topology (VR and Alpha H1 persistence), "
+    "a genus-0 ellipse curve (FastTDA), a genus-1 elliptic-type cubic curve, and the bivariate Gaussian ellipse. "
+    "Story: 1 the question and the data, 2 the four methods, 3 the contest over three tide events, 4 why the Gaussian "
+    "ellipse wins (it measures how connected the ditch is to the tide), 5 the payoff in better predictions.")
+ids = prs.slides._sldIdLst
+last = ids[-1]
+ids.remove(last)
+ids.insert(0, last)
+
 prs.save(OUT)
 print("wrote", OUT)
