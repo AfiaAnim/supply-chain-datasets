@@ -319,9 +319,11 @@ def fit_hinge(X, y, cols):
     return predict, h
 
 
-def blocked_cv(table, models):
-    """Leave-one-day-out over both events (each day of each event is one block)."""
-    blocks = table["Event"] + " day " + (table["Hour"] // 24).astype(int).astype(str)
+def blocked_cv(table, models, scheme="day"):
+    """scheme "day": leave one day of one event out at a time; "event": train on the other events and
+    predict a whole event (does the model carry over to a tide event it has never seen?)."""
+    blocks = (table["Event"] + " day " + (table["Hour"] // 24).astype(int).astype(str)) if scheme == "day" \
+        else table["Event"]
     preds = {m: np.full(len(table), np.nan) for m in models}
     levels = []
     for b in blocks.unique():
@@ -405,22 +407,30 @@ feats = [f for f in FEATURE_FUNS if COMPUTE[f] and table[f"tide: {f}"].notna().a
 
 # --- comparison table ---
 types = list(dict.fromkeys(table["Tide_type"]))
+names = list(dict.fromkeys(table["Event"]))
+short = {n: re.sub(r"\s*\(.*", "", n) + " " + re.search(r"\((\d+ \w+)", n).group(1).split()[1] + " "
+         + n[-5:-1] if re.search(r"\((\d+ \w+)", n) else n for n in names}             # e.g. "King Tide Dec 2025"
 comp = []
 for c in CLOUDS:
     for f in feats:
         col = f"{c}: {f}"
         row = {"Cloud": c, "Feature": f, "Fit failures %": 100 * table[col].isna().mean(),
                "ms per window": timing[f]}
-        for ty in types:
-            m = table["Tide_type"] == ty
-            row[f"rho with depth ({ty})"] = table.loc[m, col].corr(table.loc[m, "Ditch_depth_m"], method="spearman")
-        if len(types) == 2:                                          # condition separation, per tidal cycle
-            cyc = table.assign(c=(table["Hour"] // (1 / min_f)).astype(int)).groupby(["Event", "c"]).agg(
-                v=(col, "max"), ty=("Tide_type", "first"))
-            a, b = cyc.loc[cyc.ty == types[0], "v"].dropna(), cyc.loc[cyc.ty == types[1], "v"].dropna()
+        for n in names:                                            # link with the ditch depth, per event
+            m = table["Event"] == n
+            row[f"rho with depth ({short[n]})"] = table.loc[m, col].corr(table.loc[m, "Ditch_depth_m"], method="spearman")
+        cyc = table.assign(c=(table["Hour"] // (1 / min_f)).astype(int)).groupby(["Event", "c"]).agg(
+            v=(col, "max"), ty=("Tide_type", "first")).dropna()   # per tidal-cycle peak
+        for n in names:
+            row[f"cycle peak ({short[n]})"] = cyc.loc[n, "v"].median() if n in cyc.index.get_level_values(0) else np.nan
+        if len(names) > 1 and len(cyc) > len(names):                # share of the variance between events
+            grand = cyc["v"].mean()
+            between = sum(len(g) * (g.mean() - grand) ** 2 for _, g in cyc.groupby(level=0)["v"])
+            row["event separation (eta2)"] = between / np.sum((cyc["v"] - grand) ** 2)
+        if len(types) == 2:                                        # Regular vs King tide
+            a, b = cyc.loc[cyc.ty == types[0], "v"], cyc.loc[cyc.ty == types[1], "v"]
             pooled = np.sqrt((a.var() + b.var()) / 2)
-            row[f"cycle peak {types[0]}"], row[f"cycle peak {types[1]}"] = a.median(), b.median()
-            row["separation (Cohen d)"] = (a.median() - b.median()) / pooled if pooled > 0 else np.nan
+            row[f"separation {types[0]} vs {types[1]} (Cohen d)"] = (a.median() - b.median()) / pooled if pooled > 0 else np.nan
         comp.append(row)
 comp = pd.DataFrame(comp)
 print("\nFeature comparison:")
@@ -445,26 +455,32 @@ try:
     models["Gradient boosting (memory + all tide TDA)"] = ("gb", memory + [fill[f] for f in feats])
 except ImportError:
     print("scikit-learn not found: gradient boosting skipped")
-preds, levels = blocked_cv(table, models)
 y = table["Ditch_depth_m"].to_numpy()
-pred_rows = []
-for m, p in preds.items():
-    row = {"Model": m, "RMSE m": np.sqrt(np.nanmean((p - y) ** 2)),
-           "R2": 1 - np.nansum((p - y) ** 2) / np.sum((y - y.mean()) ** 2)}
-    for ty in types:
-        k = (table["Tide_type"] == ty).to_numpy()
-        row[f"RMSE m ({ty})"] = np.sqrt(np.nanmean((p[k] - y[k]) ** 2))
-    pred_rows.append(row)
-pred = pd.DataFrame(pred_rows)
-base_rmse = pred.loc[pred.Model == "Hinge + memory", "RMSE m"].iloc[0]
-pred["vs hinge + memory %"] = 100 * (1 - pred["RMSE m"] / base_rmse)
-if "Gradient boosting (memory)" in preds:                          # gain of each feature within the model type
-    gb_rmse = pred.loc[pred.Model == "Gradient boosting (memory)", "RMSE m"].iloc[0]
-    pred["vs same model without shape %"] = np.where(pred.Model.str.startswith("Gradient"),
-                                                     100 * (1 - pred["RMSE m"] / gb_rmse), pred["vs hinge + memory %"])
-print(f"\nDitch depth from the tide only (leave-one-day-out; flooding level learned: "
-      f"{np.median(levels):.2f} m NAVD88 median):")
-print(pred.round(4).to_string(index=False))
+schemes = {"Leave one day out": "day"} | ({"Leave one event out": "event"} if len(names) > 2 else {})
+pred_tables, preds_all = [], {}
+for sname, sch in schemes.items():
+    preds, levels = blocked_cv(table, models, sch)
+    preds_all[sname] = preds
+    rows_ = []
+    for m, p in preds.items():
+        row = {"Validation": sname, "Model": m, "RMSE m": np.sqrt(np.nanmean((p - y) ** 2)),
+               "R2": 1 - np.nansum((p - y) ** 2) / np.sum((y - y.mean()) ** 2)}
+        for n in names:
+            k = (table["Event"] == n).to_numpy()
+            row[f"RMSE m ({short[n]})"] = np.sqrt(np.nanmean((p[k] - y[k]) ** 2))
+        rows_.append(row)
+    pt = pd.DataFrame(rows_)
+    base_rmse = pt.loc[pt.Model == "Hinge + memory", "RMSE m"].iloc[0]
+    pt["vs hinge + memory %"] = 100 * (1 - pt["RMSE m"] / base_rmse)
+    if "Gradient boosting (memory)" in preds:                       # gain of each feature within the model type
+        gb_rmse = pt.loc[pt.Model == "Gradient boosting (memory)", "RMSE m"].iloc[0]
+        pt["vs same model without shape %"] = np.where(pt.Model.str.startswith("Gradient"),
+                                                       100 * (1 - pt["RMSE m"] / gb_rmse), pt["vs hinge + memory %"])
+    pred_tables.append(pt)
+    print(f"\nDitch depth from the tide only - {sname} (flooding level learned: {np.median(levels):.2f} m NAVD88 median):")
+    print(pt.drop(columns="Validation").round(4).to_string(index=False))
+pred = pd.concat(pred_tables, ignore_index=True)
+preds = preds_all["Leave one day out"]
 
 with pd.ExcelWriter(os.path.join(output_path, "tide_tda_windows.xlsx"), engine="openpyxl") as wr:
     pd.DataFrame([{"event": ev["name"], "lag_h": ev["lag_h"], "lag_r": ev["lag_r"], "samples": len(ev["h"])} for ev in events]
@@ -473,7 +489,8 @@ with pd.ExcelWriter(os.path.join(output_path, "tide_tda_windows.xlsx"), engine="
                      "harmonize_hourly": harmonize_hourly}]).to_excel(wr, sheet_name="Events", index=False)
     comp.to_excel(wr, sheet_name="Feature_comparison", index=False)
     pred.to_excel(wr, sheet_name="Prediction", index=False)
-    table.assign(**{f"pred: {m}": p for m, p in preds.items()}).to_excel(wr, sheet_name="Windows", index=False)
+    table.assign(**{f"pred ({sn}): {m}": p for sn, pr in preds_all.items() for m, p in pr.items()}).to_excel(
+        wr, sheet_name="Windows", index=False)
 print(f"Saved: {os.path.join(output_path, 'tide_tda_windows.xlsx')}")
 
 
@@ -565,37 +582,49 @@ for ev in events:
     a3.legend(frameon=False, fontsize=7, ncol=3, loc="upper center", bbox_to_anchor=(0.5, -0.2))
     fig.suptitle(f"Sliding-window TDA of the tide (window {w / freq:.1f} h, tau {tau / freq:.2f} h)", fontweight="bold")
     fig.tight_layout()
-    save(fig, f"F2_window_{re.sub(r'[^A-Za-z0-9]+', '_', ev['type'])}.png")
+    save(fig, f"F2_window_{re.sub(r'[^A-Za-z0-9]+', '_', short[ev['name']]).strip('_')}.png")
 
 # === F3: feature comparison ===
-metrics = [c for c in comp.columns if c.startswith("rho with depth")] + (["separation (Cohen d)"] if len(types) == 2 else [])
-fig, axes = plt.subplots(1, len(metrics) + 1, figsize=(4.6 * (len(metrics) + 1), 4.2), squeeze=False)
+metrics = [c for c in comp.columns if c.startswith("rho with depth") or c.startswith("separation")
+           or c.startswith("event separation")]
+panels = ["Fit failures %"] + metrics
+ncol = min(3, len(panels))
+nrow = int(np.ceil(len(panels) / ncol))
+fig, axes = plt.subplots(nrow, ncol, figsize=(5.4 * ncol, 4.4 * nrow), squeeze=False)
 labels = [f"{r.Cloud}: {r.Feature}" for r in comp.itertuples()]
 yy = np.arange(len(comp))[::-1]
-for ax, mcol in zip(axes[0], ["Fit failures %"] + metrics):
+for ax in axes.flat[len(panels):]:
+    ax.axis("off")
+for k, (ax, mcol) in enumerate(zip(axes.flat, panels)):
     ax.barh(yy, comp[mcol], color=[COLORS[f] for f in comp["Feature"]])
     ax.set_title(mcol, fontsize=9, fontweight="bold")
     ax.axvline(0, color="#3d3d3a", lw=0.6)
-    ax.set_yticks(yy, labels if ax is axes[0, 0] else [""] * len(labels), fontsize=7)
+    ax.set_yticks(yy, labels if k % ncol == 0 else [""] * len(labels), fontsize=7)
     ax.grid(axis="x", color="#e4e3df", lw=0.6)
     ax.spines[["top", "right"]].set_visible(False)
 fig.suptitle("Feature comparison (tide / ditch / loop clouds)", fontweight="bold")
 fig.tight_layout()
 save(fig, "F3_feature_comparison.png")
 
-# === F4: prediction ===
-fig, ax = plt.subplots(figsize=(9, 0.42 * len(pred) + 1.5))
-yy = np.arange(len(pred))[::-1]
-ax.barh(yy, pred["RMSE m"], color=["#8a8984" if ("TDA" not in m and not any(f in m for f in feats)) else "#eb6834"
-                                   for m in pred["Model"]])
-for yi, r, g in zip(yy, pred["RMSE m"], pred["vs hinge + memory %"]):
-    ax.text(r * 1.01, yi, f"{r:.3f} m ({g:+.0f}%)", va="center", fontsize=8)
-ax.set_yticks(yy, pred["Model"], fontsize=8)
-ax.set_xlabel("RMSE of the ditch depth (m), leave-one-day-out; (%) = change vs hinge + memory")
-ax.set_xlim(0, 1.3 * pred["RMSE m"].max())
-ax.grid(axis="x", color="#e4e3df", lw=0.6)
-ax.spines[["top", "right"]].set_visible(False)
-ax.set_title("Does a tide shape feature improve the ditch-depth prediction? (orange = uses a shape feature)",
-             fontsize=10, fontweight="bold")
+# === F4: prediction, one panel per validation scheme ===
+sch_names = list(dict.fromkeys(pred["Validation"]))
+fig, axes = plt.subplots(1, len(sch_names), figsize=(8.5 * len(sch_names), 0.42 * len(models) + 1.8),
+                         sharey=True, squeeze=False)
+gain_col = "vs same model without shape %" if "vs same model without shape %" in pred else "vs hinge + memory %"
+for ax, sn in zip(axes[0], sch_names):
+    q = pred[pred["Validation"] == sn].reset_index(drop=True)
+    yy = np.arange(len(q))[::-1]
+    ax.barh(yy, q["RMSE m"], color=["#8a8984" if ("TDA" not in m and not any(f in m for f in feats)) else "#eb6834"
+                                    for m in q["Model"]])
+    for yi, r, g in zip(yy, q["RMSE m"], q[gain_col]):
+        ax.text(r * 1.01, yi, f"{r:.3f} m ({g:+.0f}%)", va="center", fontsize=8)
+    ax.set_yticks(yy, q["Model"], fontsize=8)
+    ax.set_xlim(0, 1.32 * q["RMSE m"].max())
+    ax.set_xlabel("RMSE of the ditch depth (m)")
+    ax.set_title(sn, fontsize=11, fontweight="bold")
+    ax.grid(axis="x", color="#e4e3df", lw=0.6)
+    ax.spines[["top", "right"]].set_visible(False)
+fig.suptitle("Does a tide shape feature improve the ditch-depth prediction? (orange = uses a shape feature; "
+             "% = change vs the same model without shape features)", fontsize=10, fontweight="bold")
 fig.tight_layout()
 save(fig, "F4_prediction.png")
